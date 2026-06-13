@@ -1,0 +1,6 @@
+{
+	"ver": 1,
+	"name": "PDF Highlighter",
+	"icon": "highlight",
+	"description": "Highlight text in a PDF attached to a note and extract it into the note as a colour-coded quote with a clickable backlink to the page. Hooks Thymer's built-in PDF preview, so the highlights live right where you read."
+}
