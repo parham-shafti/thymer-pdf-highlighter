@@ -4,7 +4,7 @@ PDF Highlighter is a [Thymer](https://thymer.com) plugin for highlighting text i
 
 It works by hooking Thymer's own built-in PDF preview (which is [PDF.js](https://mozilla.github.io/pdf.js/) under the hood), so there's no second viewer to load and nothing to slow down — your PDF opens beside your note exactly as it always does, just with highlighting added.
 
-![Highlight a passage in the PDF, get a colour-coded quote with a backlink in the note](screenshots/demo.png)
+![Highlight a passage in the PDF, get a colour-coded quote with a backlink in the note](screenshots/hero.png)
 
 ## How to use
 
@@ -12,7 +12,7 @@ It works by hooking Thymer's own built-in PDF preview (which is [PDF.js](https:/
 2. **Open it** — click the attached PDF. Thymer opens it in a preview panel next to the note.
 3. **Highlight** — select some text in the PDF. A small colour toolbar appears just above your selection; click a colour. The passage is painted in that colour in the PDF and added to the note's **Highlights** section as a quote block, ending with a `p.N ↗` backlink.
 
-   ![The five-colour toolbar appears above your selection](screenshots/demo2.png)
+   ![The five-colour toolbar appears above your selection](screenshots/toolbar.png)
 
 4. **Jump back** — click the `p.N ↗` link (or its arrow) on any extract. The PDF jumps to that page and pulses the highlight. If the PDF is closed, it reopens beside the note first.
 5. **Delete a highlight** — hover the highlighted text in the PDF; a small **✕** appears at its start. Click it to remove both the highlight and its extract from the note.
