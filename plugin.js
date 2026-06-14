@@ -738,6 +738,7 @@ class Plugin extends AppPlugin {
         const h = await note.createLineItem(null, after, "heading");
         if (h) {
           h.setSegments([{ type: "text", text: "Highlights" }]);
+          try { h.setHeadingSize(2); } catch (e) {} // H2 (default would be H1)
           try { h.setMetaProperties({ pdfhl_heading: 1 }); } catch (e) {}
           return { parentItem: h, after: null };
         }
