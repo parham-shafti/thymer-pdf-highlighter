@@ -47,7 +47,8 @@ class Plugin extends AppPlugin {
       { code: "heb", label: "Hebrew" },
     ];
     this._ocrLang = "eng";
-    try { const conf = this.getConfiguration(); if (conf && conf.custom && conf.custom.ocrLang) this._ocrLang = conf.custom.ocrLang; } catch (e) {}
+    this._hlColor = "yellow"; // remembered highlight colour, auto-applied to new highlights
+    try { const conf = this.getConfiguration(); if (conf && conf.custom) { if (conf.custom.ocrLang) this._ocrLang = conf.custom.ocrLang; if (conf.custom.hlColor) this._hlColor = conf.custom.hlColor; } } catch (e) {}
     this._cmds = []; // registered command-palette commands (removed on teardown)
 
     this._hooked = new WeakSet();     // iframes already wired
@@ -97,7 +98,7 @@ class Plugin extends AppPlugin {
         const d = fr.contentDocument;
         if (!d) return;
         if (d.__pdfhlTeardown) { try { d.__pdfhlTeardown(); } catch (e) {} }
-        d.querySelectorAll(".pdfhl-toolbar, .pdfhl-overlay, .pdfhl-marquee, .pdfhl-menu, #pdfhl-style").forEach((n) => n.remove());
+        d.querySelectorAll(".pdfhl-overlay, .pdfhl-marquee, .pdfhl-menu, #pdfhl-style").forEach((n) => n.remove());
         d.__pdfhlTeardown = null;
       } catch (e) {}
     });
@@ -171,7 +172,7 @@ class Plugin extends AppPlugin {
       setTimeout(() => this._onSelectionSettled(hook), 0);
     };
     const onSelDown = (e) => {
-      if (e.target.closest && (e.target.closest(".pdfhl-toolbar") || e.target.closest(".pdfhl-menu"))) return;
+      if (e.target.closest && e.target.closest(".pdfhl-menu")) return;
       this._hideToolbar(hook);
       this._closeHighlightMenu(hook); // any click outside the menu dismisses it
       if (e.button !== 0) return;
@@ -190,11 +191,19 @@ class Plugin extends AppPlugin {
     const onMove = (e) => {
       if (hook.marquee && hook.marquee.active) this._updateMarquee(hook, e);
     };
+    // Shift+drag boxes accumulate; releasing Shift OCRs them all as one extract. Esc discards.
+    const onKeyUp = (e) => { if (e.key === "Shift") this._commitOcrBoxes(hook); };
+    const onKeyDown = (e) => { if (e.key === "Escape") this._cancelOcrBoxes(hook); };
     doc.addEventListener("mouseup", onMouseUp, true);
     doc.addEventListener("mousedown", onSelDown, true);
     doc.addEventListener("scroll", onScroll, true);
     doc.addEventListener("mousemove", onMove, true);
     doc.addEventListener("contextmenu", onCtx, true);
+    doc.addEventListener("keyup", onKeyUp, true);
+    doc.addEventListener("keydown", onKeyDown, true);
+    // Shift keyup can land on the top window if focus left the iframe — catch it there too
+    // (commit is idempotent, so a double-fire is harmless).
+    window.addEventListener("keyup", onKeyUp, true);
 
     // Redraw stored overlays as pages (re)render. textlayerrendered fires after
     // pagerendered, once the text layer (our positioning reference) exists.
@@ -221,12 +230,16 @@ class Plugin extends AppPlugin {
       try { doc.removeEventListener("scroll", onScroll, true); } catch (e) {}
       try { doc.removeEventListener("mousemove", onMove, true); } catch (e) {}
       try { doc.removeEventListener("contextmenu", onCtx, true); } catch (e) {}
+      try { doc.removeEventListener("keyup", onKeyUp, true); } catch (e) {}
+      try { doc.removeEventListener("keydown", onKeyDown, true); } catch (e) {}
+      try { window.removeEventListener("keyup", onKeyUp, true); } catch (e) {}
       try { this._closeHighlightMenu(hook); } catch (e) {}
       try { app.eventBus.off("textlayerrendered", onRendered); } catch (e) {}
       try { app.eventBus.off("pagerendered", onRendered); } catch (e) {}
       try { app.eventBus.off("pagesloaded", onRendered); } catch (e) {}
       try { tlObserver.disconnect(); } catch (e) {}
       try { this._cancelMarquee(hook); } catch (e) {}
+      try { this._cancelOcrBoxes(hook); } catch (e) {}
       try { if (hook.toolbar) hook.toolbar.remove(); } catch (e) {}
       try { doc.querySelectorAll(".pdfhl-overlay").forEach((n) => n.remove()); } catch (e) {}
       hook.toolbar = null;
@@ -255,54 +268,35 @@ class Plugin extends AppPlugin {
   // =======================================================================
   _onSelectionSettled(hook) {
     const sel = hook.win.getSelection();
-    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { this._hideToolbar(hook); return; }
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
     const range = sel.getRangeAt(0);
     // Selection must be inside a text layer.
     const anchorEl = range.startContainer.nodeType === 1 ? range.startContainer : range.startContainer.parentElement;
-    if (!anchorEl || !anchorEl.closest(".textLayer")) { this._hideToolbar(hook); return; }
+    if (!anchorEl || !anchorEl.closest(".textLayer")) return;
     const rects = [...range.getClientRects()].filter((r) => r.width > 1 && r.height > 1);
-    if (!rects.length) { this._hideToolbar(hook); return; }
-
+    if (!rects.length) return;
+    // Auto-apply the remembered colour straight away — no toolbar. Recolour later
+    // via right-click, which also updates the remembered colour.
     this._pendingRange = range.cloneRange();
     this._activeHook = hook;
-    hook._pendingRegion = null; // this toolbar is for a text selection, not OCR
-    // Bounding box of the selection → toolbar sits centred just above its top.
-    let top = Infinity, bottom = -Infinity, left = Infinity, right = -Infinity;
-    for (const r of rects) { if (r.top < top) top = r.top; if (r.bottom > bottom) bottom = r.bottom; if (r.left < left) left = r.left; if (r.right > right) right = r.right; }
-    this._showToolbar(hook, (left + right) / 2, top, bottom);
+    hook._pendingRegion = null;
+    this._extract(hook, this._currentColor());
   }
 
-  _showToolbar(hook, centerX, selTop, selBottom) {
-    let tb = hook.toolbar;
-    if (!tb) {
-      tb = hook.doc.createElement("div");
-      tb.className = "pdfhl-toolbar";
-      for (const c of this.COLORS) {
-        const sw = hook.doc.createElement("button");
-        sw.className = "pdfhl-swatch";
-        sw.title = "Highlight → extract (" + c.label + ")";
-        sw.style.background = "rgb(" + c.rgb + ")";
-        sw.addEventListener("mousedown", (e) => e.preventDefault()); // keep selection
-        sw.addEventListener("click", (e) => {
-          e.preventDefault(); e.stopPropagation();
-          if (hook._pendingRegion) this._extractOCR(hook, c);
-          else this._extract(hook, c);
-        });
-        tb.appendChild(sw);
-      }
-      hook.doc.body.appendChild(tb);
-      hook.toolbar = tb;
-    }
-    // Centre above the selection; drop below it only if there's no room above.
-    const pad = 8, H = 34, W = 5 * 26 + 22;
-    let left = centerX - W / 2;
-    left = Math.max(pad, Math.min(left, hook.win.innerWidth - W - pad));
-    let top = selTop - H - 8;
-    if (top < pad) top = selBottom + 8;
-    top = Math.max(pad, Math.min(top, hook.win.innerHeight - H - pad));
-    tb.style.top = top + "px";
-    tb.style.left = left + "px";
-    tb.style.display = "flex";
+  // The remembered highlight colour, auto-applied to new highlights.
+  _currentColor() { return this.COLORS.find((c) => c.key === this._hlColor) || this.COLORS[0]; }
+
+  // Remember a colour as the default for new highlights (persisted in config).
+  _setHlColor(key) {
+    if (!this.COLORS.some((c) => c.key === key)) return;
+    this._hlColor = key;
+    try {
+      const conf = this.getConfiguration();
+      conf.custom = conf.custom || {};
+      conf.custom.hlColor = key;
+      const mine = (this.data.getAllGlobalPlugins() || []).find((g) => g.guid === this.getGuid());
+      if (mine && typeof mine.saveConfiguration === "function") mine.saveConfiguration(conf);
+    } catch (e) {}
   }
 
   _hideToolbar(hook) {
@@ -335,16 +329,16 @@ class Plugin extends AppPlugin {
   // Write an extract into the note as a Thymer QUOTE BLOCK: a "block" line
   // (blockStyle "quote") whose paragraphs are "text" children, with the backlink
   // arrow ("p.N" link + ti-arrow-up-right icon) at the end of the last paragraph.
-  // Shared by the text-selection and OCR paths. For OCR, `ocrRect` is the marquee
-  // rectangle (normalised) — it's encoded in the backlink so the overlay is fully
-  // reconstructable from the note alone (a scanned page has no text layer to match).
-  async _commitExtract(hook, note, { paragraphs, page, color, rectsByPage, ocrRect }) {
+  // Shared by the text-selection and OCR paths. For OCR, `ocrRects` are the marquee
+  // rectangles (normalised, one per box) — encoded in the backlink so the overlay is
+  // fully reconstructable from the note alone (a scanned page has no text layer to match).
+  async _commitExtract(hook, note, { paragraphs, page, color, rectsByPage, ocrRects }) {
     const quote = paragraphs.join("\n\n");
     const hid = "h" + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36);
     const fileGuid = this._currentFileGuid(hook);
     let backlink = "https://" + this.BACKLINK_HOST + "/open?pdf=" + encodeURIComponent(hook.fingerprint) +
       "&page=" + page + "&color=" + color.key + "&file=" + encodeURIComponent(fileGuid || "") + "&hid=" + hid;
-    if (ocrRect) backlink += "&ocr=1&rect=" + [ocrRect.x, ocrRect.y, ocrRect.w, ocrRect.h].map((n) => Number(n).toFixed(4)).join(",");
+    if (ocrRects && ocrRects.length) backlink += "&ocr=1&rect=" + ocrRects.map((r) => [r.x, r.y, r.w, r.h].map((n) => Number(n).toFixed(4)).join(",")).join(";");
 
     let loc;
     try { loc = await this._highlightsParent(note); }
@@ -402,7 +396,7 @@ class Plugin extends AppPlugin {
     const el = hook.doc.createElement("div");
     el.className = "pdfhl-marquee";
     hook.doc.body.appendChild(el);
-    hook.marquee = { active: true, pageEl, startX: e.clientX, startY: e.clientY, el };
+    hook.marquee = { active: true, pageEl, startX: e.clientX, startY: e.clientY, el, shift: !!e.shiftKey };
     this._updateMarquee(hook, e);
   }
 
@@ -420,55 +414,104 @@ class Plugin extends AppPlugin {
 
   _finishMarquee(hook, e) {
     const m = hook.marquee; if (!m) return;
-    const pageEl = m.pageEl;
+    const pageEl = m.pageEl, el = m.el, wasShift = m.shift;
     const left = Math.min(m.startX, e.clientX), top = Math.min(m.startY, e.clientY);
     const right = Math.max(m.startX, e.clientX), bottom = Math.max(m.startY, e.clientY);
-    this._cancelMarquee(hook);
-    if (right - left < 8 || bottom - top < 8) { this._hideToolbar(hook); return; } // a click, not a drag
+    hook.marquee = null; // detach; `el` is managed directly below
+    const drop = () => { try { el.remove(); } catch (er) {} };
+    if (right - left < 8 || bottom - top < 8) { drop(); return; } // a click, not a drag
     // Normalise against the text layer box (== canvas == page content box).
     const ref = (pageEl.querySelector(".textLayer") || pageEl.querySelector("canvas")).getBoundingClientRect();
-    if (!ref.width || !ref.height) { this._hideToolbar(hook); return; }
+    if (!ref.width || !ref.height) { drop(); return; }
     const clamp = (v) => Math.max(0, Math.min(1, v));
     const x = clamp((left - ref.left) / ref.width), y = clamp((top - ref.top) / ref.height);
     const x2 = clamp((right - ref.left) / ref.width), y2 = clamp((bottom - ref.top) / ref.height);
     const rect = { x, y, w: Math.max(0, x2 - x), h: Math.max(0, y2 - y) };
-    if (rect.w < 0.01 || rect.h < 0.01) { this._hideToolbar(hook); return; }
+    if (rect.w < 0.01 || rect.h < 0.01) { drop(); return; }
     const page = parseInt(pageEl.getAttribute("data-page-number"), 10) || this._currentPage(hook);
-    hook._pendingRegion = { page, rect };
-    this._pendingRange = null;
-    this._showToolbar(hook, (left + right) / 2, top, bottom);
+    if (wasShift) {
+      // Accumulate this box (keep it outlined); commit them all on Shift release.
+      el.classList.add("pdfhl-marquee-pending");
+      (hook._ocrBoxes = hook._ocrBoxes || []).push({ page, rect, el });
+    } else {
+      drop();
+      hook._pendingRegion = { page, rect };
+      this._pendingRange = null;
+      this._extractOCR(hook, this._currentColor());
+    }
+  }
+
+  // Shift released -> OCR every accumulated box together as one extract.
+  _commitOcrBoxes(hook) {
+    const boxes = hook._ocrBoxes || [];
+    if (!boxes.length) return;
+    hook._ocrBoxes = [];
+    boxes.forEach((b) => { try { b.el.remove(); } catch (e) {} });
+    this._ocrAndExtract(hook, boxes.map((b) => ({ page: b.page, rect: b.rect })), this._currentColor());
+  }
+
+  // Esc -> discard the pending boxes without extracting.
+  _cancelOcrBoxes(hook) {
+    const boxes = hook._ocrBoxes || [];
+    hook._ocrBoxes = [];
+    boxes.forEach((b) => { try { b.el.remove(); } catch (e) {} });
   }
 
   async _extractOCR(hook, color) {
     const region = hook._pendingRegion;
     if (!region) return;
+    hook._pendingRegion = null;
+    await this._ocrAndExtract(hook, [region], color);
+  }
+
+  // OCR one or more boxed regions (sorted into reading order), combine the text, and
+  // write a single extract. Multiple regions come from Shift-boxing several lines, so
+  // you can start mid-sentence and skip the ragged ends.
+  async _ocrAndExtract(hook, regions, color) {
+    regions = (regions || []).filter((r) => r && r.rect);
+    if (!regions.length) return;
     const note = this._findAssociatedNote(hook.iframe);
     if (!note) {
       this.ui.addToaster({ title: "No note found", message: "Open the PDF beside its note, then highlight.", dismissible: true });
       return;
     }
-    this._hideToolbar(hook);
+    const sorted = regions.slice().sort((a, b) => (a.page - b.page) || (a.rect.y - b.rect.y) || (a.rect.x - b.rect.x));
     const lang = this.OCR_LANGUAGES.find((x) => x.code === this._ocrLang);
-    const prog = this.ui.addToaster({ title: "Running OCR…", message: "Reading " + (lang ? lang.label : "text") + " from the highlighted region.", dismissible: false });
-    let text = "";
+    const more = sorted.length > 1 ? " (" + sorted.length + " boxes)" : "";
+    const prog = this.ui.addToaster({ title: "Running OCR…", message: "Reading " + (lang ? lang.label : "text") + more + "…", dismissible: false });
+    const texts = [];
     try {
-      text = await this._ocrRegion(hook, region.page, region.rect);
+      for (const r of sorted) { const t = await this._ocrRegion(hook, r.page, r.rect); texts.push((t || "").trim()); }
     } catch (e) {
       try { prog && prog.destroy(); } catch (_) {}
       this.ui.addToaster({ title: "OCR failed", message: String((e && e.message) || e), dismissible: true });
-      hook._pendingRegion = null;
       return;
     }
     try { prog && prog.destroy(); } catch (_) {}
-    const paragraphs = this._ocrTextToParagraphs(text);
+    const paragraphs = sorted.length === 1 ? this._ocrTextToParagraphs(texts[0]) : this._joinOcrBoxes(texts);
     if (!paragraphs.length) {
-      this.ui.addToaster({ title: "No text found", message: "OCR didn't find readable text in that region.", dismissible: true, autoDestroyTime: 2800 });
-      hook._pendingRegion = null;
+      this.ui.addToaster({ title: "No text found", message: "OCR didn't find readable text in that selection.", dismissible: true, autoDestroyTime: 2800 });
       return;
     }
-    const rectsByPage = {}; rectsByPage[region.page] = [region.rect];
-    await this._commitExtract(hook, note, { paragraphs, page: region.page, color, rectsByPage, ocrRect: region.rect });
-    hook._pendingRegion = null;
+    const rectsByPage = {};
+    for (const r of sorted) (rectsByPage[r.page] = rectsByPage[r.page] || []).push(r.rect);
+    const page = sorted[0].page;
+    const ocrRects = sorted.filter((r) => r.page === page).map((r) => r.rect);
+    await this._commitExtract(hook, note, { paragraphs, page, color, rectsByPage, ocrRects });
+  }
+
+  // Join per-box OCR text (each box ≈ a line/fragment) into one flowing passage,
+  // de-hyphenating broken words at box boundaries.
+  _joinOcrBoxes(texts) {
+    const lines = (texts || []).map((t) => (t || "").replace(/\s+/g, " ").trim()).filter(Boolean);
+    if (!lines.length) return [];
+    const combined = lines.reduce((acc, line) => {
+      if (!acc) return line;
+      if (/[‐-―-]$/.test(acc) && /^[a-zà-ÿ]/.test(line)) return acc.replace(/[‐-―-]$/, "") + line;
+      return acc + " " + line;
+    }, "");
+    const out = combined.replace(/\s+/g, " ").trim();
+    return out ? [out] : [];
   }
 
   async _ocrRegion(hook, page, rect) {
@@ -930,6 +973,7 @@ class Plugin extends AppPlugin {
   // Recolour an existing highlight: the in-memory store, the overlay, AND the colour
   // param in the note's backlink URL (so a later rebuild-from-note keeps the change).
   async _changeHighlightColor(hook, hid, colorKey) {
+    this._setHlColor(colorKey); // recolouring also sets the default for new highlights
     const store = this._getStore();
     const hl = (store[hook.fingerprint] || []).find((h) => h.hid === hid);
     if (hl) { hl.color = colorKey; this._setStore(store); }
@@ -1067,19 +1111,22 @@ class Plugin extends AppPlugin {
         .map((k) => (k.li.segments || []).filter((s) => s.type !== "linkobj").map((s) => (typeof s.text === "string" ? s.text : "")).join(""))
         .map((t) => t.trim()).filter(Boolean);
       const ocr = u.searchParams.get("ocr") === "1";
-      let rect = null;
+      let rects = null;
       const rstr = u.searchParams.get("rect");
-      if (rstr) { const a = rstr.split(",").map(Number); if (a.length === 4 && a.every((n) => !isNaN(n))) rect = { x: a[0], y: a[1], w: a[2], h: a[3] }; }
-      hls.push({ hid, page, color, paragraphs, ocr, rect });
+      if (rstr) {
+        rects = rstr.split(";").map((s) => s.split(",").map(Number)).filter((a) => a.length === 4 && a.every((n) => !isNaN(n))).map((a) => ({ x: a[0], y: a[1], w: a[2], h: a[3] }));
+        if (!rects.length) rects = null;
+      }
+      hls.push({ hid, page, color, paragraphs, ocr, rects });
     }
 
     // locate rects for each, on whatever page is currently rendered; keep prior rects otherwise
     const prior = this._getStore()[hook.fingerprint] || [];
     const result = hls.map((h) => {
       let rectsByPage = {};
-      // OCR highlights carry their (single) overlay rect in the backlink URL — a
-      // scanned page has no text layer to locate text in, so use it directly.
-      if (h.ocr && h.rect) { rectsByPage[h.page] = [h.rect]; return { hid: h.hid, page: h.page, color: h.color, rectsByPage }; }
+      // OCR highlights carry their overlay rect(s) in the backlink URL — a scanned
+      // page has no text layer to locate text in, so use them directly.
+      if (h.ocr && h.rects) { rectsByPage[h.page] = h.rects; return { hid: h.hid, page: h.page, color: h.color, rectsByPage }; }
       const pageEl = [...hook.doc.querySelectorAll(".page")].find((p) => parseInt(p.getAttribute("data-page-number"), 10) === h.page);
       if (pageEl && pageEl.querySelector(".textLayer")) {
         const rects = [];
@@ -1205,8 +1252,6 @@ class Plugin extends AppPlugin {
     const s = doc.createElement("style");
     s.id = "pdfhl-style";
     s.textContent = [
-      ".pdfhl-toolbar{position:fixed;z-index:2147483647;display:none;gap:6px;padding:6px 8px;border-radius:10px;",
-      "background:#1f1f1f;box-shadow:0 4px 16px rgba(0,0,0,.4);align-items:center;}",
       ".pdfhl-swatch{width:20px;height:20px;border-radius:50%;border:2px solid rgba(255,255,255,.85);cursor:pointer;padding:0;}",
       ".pdfhl-swatch:hover{transform:scale(1.15);}",
       ".pdfhl-overlay{position:absolute;inset:0;pointer-events:none;z-index:3;}",
@@ -1215,6 +1260,7 @@ class Plugin extends AppPlugin {
       "@keyframes pdfhl-pulse{0%{outline:0 solid rgba(0,0,0,0);}40%{outline:3px solid rgba(0,0,0,.55);}100%{outline:0 solid rgba(0,0,0,0);}}",
       ".pdfhl-marquee{position:fixed;z-index:2147483646;border:1.5px dashed rgba(31,31,31,.9);",
       "background:rgba(31,31,31,.10);pointer-events:none;border-radius:2px;}",
+      ".pdfhl-marquee-pending{border-style:solid;background:rgba(31,31,31,.18);}",
       ".pdfhl-menu{position:fixed;z-index:2147483647;background:#1f1f1f;border-radius:10px;padding:8px;",
       "box-shadow:0 6px 24px rgba(0,0,0,.45);min-width:150px;}",
       ".pdfhl-menu .pdfhl-menu-swatches{display:flex;gap:6px;padding:2px 2px 8px;justify-content:space-between;}",

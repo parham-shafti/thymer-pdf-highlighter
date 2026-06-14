@@ -1,6 +1,6 @@
 # PDF Highlighter
 
-PDF Highlighter is a [Thymer](https://thymer.com) plugin for highlighting text in a PDF attached to a note and pulling it straight into the note. Open a PDF, select a passage, pick one of five colours, and the text lands in your note as a quote — colour-coded, grouped under a **Highlights** heading, and tagged with a clickable backlink to the exact page. Click the backlink any time to jump back into the PDF, where the plugin scrolls to the passage and pulses your highlight. The highlight stays painted over the text in the PDF too, and survives reloads.
+PDF Highlighter is a [Thymer](https://thymer.com) plugin for highlighting text in a PDF attached to a note and pulling it straight into the note. Open a PDF and select a passage, and the text lands in your note as a colour-coded quote, grouped under a **Highlights** heading and tagged with a clickable backlink to the exact page. Click the backlink any time to jump back into the PDF, where the plugin scrolls to the passage and pulses your highlight. The highlight stays painted over the text in the PDF too, and survives reloads.
 
 **Scanned PDFs work too.** On an image-only page (no selectable text), drag a box around the text instead of selecting it; the plugin runs OCR on that region and drops the recognised text into your note with the same colour, backlink, and overlay.
 
@@ -12,18 +12,16 @@ It works by hooking Thymer's own built-in PDF preview (which is [PDF.js](https:/
 
 1. **Attach a PDF to a note** — drag a PDF into the note (it appears as a file in the body).
 2. **Open it** — click the attached PDF. Thymer opens it in a preview panel next to the note.
-3. **Highlight** — select some text in the PDF. A small colour toolbar appears just above your selection; click a colour. The passage is painted in that colour in the PDF and added to the note's **Highlights** section as a quote block, ending with a `p.N ↗` backlink.
-
-   ![The five-colour toolbar appears above your selection](screenshots/toolbar.png)
+3. **Highlight** — select some text and it's instantly highlighted in your current colour and added to the note's **Highlights** section as a quote block, ending with a `p.N ↗` backlink. No picking a colour each time; it uses your current one (yellow to start), and you can recolour afterwards.
 
 4. **Jump back** — click the `p.N ↗` link (or its arrow) on any extract. The PDF jumps to that page and pulses the highlight. If the PDF is closed, it reopens beside the note first.
-5. **Recolour or delete** — right-click a highlight in the PDF. A small menu appears: pick a different colour to recolour it (updated in both the PDF and the note), or **Delete highlight** to remove it along with its extract from the note.
+5. **Recolour or delete** — right-click a highlight in the PDF. A small menu appears: pick a different colour to recolour it (updated in both the PDF and the note, and it becomes the default for new highlights), or **Delete highlight** to remove it along with its extract from the note.
 
-**On a scanned (image-only) page** there's no text to select, so instead **drag a box** around the text you want. The colour toolbar appears above the box; pick a colour and the plugin OCRs that region (first use downloads the recognition engine, which takes a moment) and adds the recognised text to your note — same colours, backlink, overlay, and delete. Drawing a snug box around just the lines you want gives the cleanest result.
+**On a scanned (image-only) page** there's no text to select, so instead **drag a box** around the text you want. The plugin OCRs that region (first use downloads the recognition engine, which takes a moment) and adds the recognised text to your note in your current colour, with the same backlink, overlay, and delete. Drawing a snug box around just the lines you want gives the cleanest result.
 
 Good to know:
 
-- **Five colours.** Pick any of them per highlight; the extract carries the colour, and you can right-click a highlight to recolour it later. (Mapping colours to meanings is on the roadmap.)
+- **Five colours.** New highlights use your current colour (yellow to start); right-click any highlight to recolour it, and that colour becomes the default for new ones. (Mapping colours to meanings is on the roadmap.)
 - **Multi-line and multi-paragraph extracts** are preserved — headings stay on their own line, bullet lists stay multiline, and wrapped lines flow back together into clean paragraphs.
 - **Highlights persist.** They're reconstructed from the note's text, so they come back after a reload even if the PDF was closed — as long as the note is open beside the PDF.
 - **Lossless text on real PDFs.** When a page has a text layer, the plugin reads the actual characters, so the extracted text is exact (no OCR errors). Scanned pages fall back to OCR automatically.
@@ -35,6 +33,7 @@ Pages that are just images (scans, photographed documents) have no text layer to
 - It detects an image-only page automatically. There you **drag a box** instead of selecting text.
 - The boxed region is rendered at high resolution straight from the page and run through [Tesseract](https://github.com/naptha/tesseract.js), entirely on your machine — nothing is uploaded.
 - The recognised text is added to your note exactly like a normal highlight: same colours, backlink, coloured overlay, and delete.
+- **Multi-line capture.** To grab a passage that starts mid-sentence or skips ragged line-ends, **hold Shift and drag a box on each piece** (end of one line, the next line, part of a third); release Shift and they're OCR'd together into one extract. **Esc** discards the pending boxes.
 
 Good to know:
 

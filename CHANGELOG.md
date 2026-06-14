@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.1.0 — 2026-06-14
+
+- **Highlight in one step.** Selecting text (or finishing an OCR box) now applies your current colour instantly — no colour toolbar to click each time. Right-click a highlight to recolour it (which also sets the colour for new ones).
+- **Multi-line OCR capture.** On a scanned page, hold **Shift** and drag a box on each piece you want (so you can start mid-sentence and skip ragged line-ends); release Shift and they're OCR'd together into a single extract. **Esc** cancels.
+
 ## v2.0.0 — 2026-06-14
 
 - **OCR for scanned PDFs.** On image-only pages (no text layer) you can drag a box around the text; the region is recognised with [Tesseract](https://github.com/naptha/tesseract.js) and added to your note like a normal highlight — same colours, page backlink, coloured overlay, and delete.
