@@ -35,6 +35,20 @@ class Plugin extends AppPlugin {
     this.OCR_MAX_SCALE = 6;    // cap re-render scale (tiny pages)
     this.OCR_MAX_DIM = 5000;   // cap region-canvas longest side (memory)
     this._ocrWorkerPromise = null; // shared tesseract worker (lazy)
+    // OCR languages (Tesseract codes). The active one is loaded on demand the first
+    // time it's used; switch it via the "OCR language" command in the palette.
+    this.OCR_LANGUAGES = [
+      { code: "eng", label: "English" },
+      { code: "swe", label: "Swedish" },
+      { code: "deu", label: "German" },
+      { code: "fra", label: "French" },
+      { code: "spa", label: "Spanish" },
+      { code: "ell", label: "Greek" },
+      { code: "heb", label: "Hebrew" },
+    ];
+    this._ocrLang = "eng";
+    try { const conf = this.getConfiguration(); if (conf && conf.custom && conf.custom.ocrLang) this._ocrLang = conf.custom.ocrLang; } catch (e) {}
+    this._cmds = []; // registered command-palette commands (removed on teardown)
 
     this._hooked = new WeakSet();     // iframes already wired
     this._cleanups = [];              // teardown fns
@@ -53,6 +67,17 @@ class Plugin extends AppPlugin {
     // Hook any PDF viewer already open.
     this._scanForViewers();
 
+    // One command-palette command per OCR language (sets it for scanned-page OCR).
+    try {
+      for (const L of this.OCR_LANGUAGES) {
+        this._cmds.push(this.ui.addCommandPaletteCommand({
+          label: "PDF Highlighter: " + L.label,
+          icon: "ti-language",
+          onSelected: () => this._setOcrLang(L.code),
+        }));
+      }
+    } catch (e) {}
+
     // Functional (not debug): the next instance calls this on hot-reload to fully
     // tear down this one, so stale listeners never accumulate. See onLoad top.
     window.__pdfhlDestroy = () => this._destroy();
@@ -63,6 +88,8 @@ class Plugin extends AppPlugin {
   _destroy() {
     (this._cleanups || []).forEach((fn) => { try { fn(); } catch (e) {} });
     this._cleanups = [];
+    (this._cmds || []).forEach((c) => { try { c.remove(); } catch (e) {} });
+    this._cmds = [];
     try { this._mainObserver && this._mainObserver.disconnect(); } catch (e) {}
     document.querySelectorAll("#pdfhl-main-style").forEach((n) => n.remove());
     document.querySelectorAll("iframe.id--pdf-viewer").forEach((fr) => {
@@ -161,14 +188,7 @@ class Plugin extends AppPlugin {
       this._showHighlightMenu(hook, box.dataset.hid, e.clientX, e.clientY);
     };
     const onMove = (e) => {
-      if (hook.marquee && hook.marquee.active) { this._updateMarquee(hook, e); return; }
-      // Brighten the highlight under the cursor so it reads as interactive (right-click for options).
-      const now = Date.now();
-      if (hook._moveAt && now - hook._moveAt < 50) return;
-      hook._moveAt = now;
-      const box = this._boxAtPoint(hook, e.clientX, e.clientY);
-      const hid = box ? box.dataset.hid : null;
-      doc.querySelectorAll(".pdfhl-box").forEach((b) => b.classList.toggle("pdfhl-box-hover", hid != null && b.dataset.hid === hid));
+      if (hook.marquee && hook.marquee.active) this._updateMarquee(hook, e);
     };
     doc.addEventListener("mouseup", onMouseUp, true);
     doc.addEventListener("mousedown", onSelDown, true);
@@ -428,7 +448,8 @@ class Plugin extends AppPlugin {
       return;
     }
     this._hideToolbar(hook);
-    const prog = this.ui.addToaster({ title: "Running OCR…", message: "Reading text from the highlighted region.", dismissible: false });
+    const lang = this.OCR_LANGUAGES.find((x) => x.code === this._ocrLang);
+    const prog = this.ui.addToaster({ title: "Running OCR…", message: "Reading " + (lang ? lang.label : "text") + " from the highlighted region.", dismissible: false });
     let text = "";
     try {
       text = await this._ocrRegion(hook, region.page, region.rect);
@@ -513,7 +534,7 @@ class Plugin extends AppPlugin {
         });
       }
       if (!window.Tesseract) throw new Error("OCR engine unavailable.");
-      return await window.Tesseract.createWorker("eng", 1);
+      return await window.Tesseract.createWorker(this._ocrLang || "eng", 1);
     })();
     this._ocrWorkerPromise.catch(() => { this._ocrWorkerPromise = null; });
     return this._ocrWorkerPromise;
@@ -532,6 +553,30 @@ class Plugin extends AppPlugin {
       }, ""))
       .map((p) => p.replace(/\s+/g, " ").trim())
       .filter(Boolean);
+  }
+
+  // Set the active OCR language (from a per-language command-palette command).
+  _setOcrLang(code) {
+    const L = this.OCR_LANGUAGES.find((x) => x.code === code);
+    if (code !== this._ocrLang) {
+      this._ocrLang = code;
+      // Persist alongside the highlight store (don't clobber it).
+      try {
+        const conf = this.getConfiguration();
+        conf.custom = conf.custom || {};
+        conf.custom.ocrLang = code;
+        const mine = (this.data.getAllGlobalPlugins() || []).find((g) => g.guid === this.getGuid());
+        if (mine && typeof mine.saveConfiguration === "function") mine.saveConfiguration(conf);
+      } catch (e) {}
+      // Drop the worker so the next OCR initialises with the new language (loaded on demand).
+      try {
+        if (this._ocrWorkerPromise) {
+          this._ocrWorkerPromise.then((w) => { try { w && w.terminate && w.terminate(); } catch (e) {} }, () => {});
+          this._ocrWorkerPromise = null;
+        }
+      } catch (e) {}
+    }
+    this.ui.addToaster({ title: "OCR language", message: (L ? L.label : code) + " — used when you OCR a scanned page.", dismissible: true, autoDestroyTime: 2600 });
   }
 
   // Reconstruct multi-line / multi-paragraph text from text-layer geometry,
@@ -1167,7 +1212,6 @@ class Plugin extends AppPlugin {
       ".pdfhl-box{position:absolute;border-radius:2px;mix-blend-mode:multiply;}",
       ".pdfhl-box.pdfhl-pulse{animation:pdfhl-pulse .9s ease-out 2;}",
       "@keyframes pdfhl-pulse{0%{outline:0 solid rgba(0,0,0,0);}40%{outline:3px solid rgba(0,0,0,.55);}100%{outline:0 solid rgba(0,0,0,0);}}",
-      ".pdfhl-box-hover{outline:2px solid rgba(31,31,31,.55);}",
       ".pdfhl-marquee{position:fixed;z-index:2147483646;border:1.5px dashed rgba(31,31,31,.9);",
       "background:rgba(31,31,31,.10);pointer-events:none;border-radius:2px;}",
       ".pdfhl-menu{position:fixed;z-index:2147483647;background:#1f1f1f;border-radius:10px;padding:8px;",

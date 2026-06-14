@@ -33,14 +33,14 @@ Good to know:
 Pages that are just images (scans, photographed documents) have no text layer to read, so the plugin falls back to OCR:
 
 - It detects an image-only page automatically. There you **drag a box** instead of selecting text.
-- The boxed region is rendered at high resolution straight from the page and run through [Tesseract](https://github.com/naptha/tesseract.js) (English), entirely on your machine — nothing is uploaded.
+- The boxed region is rendered at high resolution straight from the page and run through [Tesseract](https://github.com/naptha/tesseract.js), entirely on your machine — nothing is uploaded.
 - The recognised text is added to your note exactly like a normal highlight: same colours, backlink, coloured overlay, and delete.
 
 Good to know:
 
-- **First use downloads the OCR engine** (~a few MB) from a CDN; after that it's cached. OCR needs an internet connection the first time.
-- **English only** for now, and accuracy depends on the scan quality — a clean, snug box around the lines you want reads best.
-- OCR text isn't perfect the way text-layer extraction is, so give it a quick proofread.
+- **Languages.** English, Swedish, German, French, Spanish, Greek, and Hebrew. Set the language from the Command Palette (`Cmd+P` / `Ctrl+P`) — there's a command per language, e.g. **PDF Highlighter: Swedish**. Your choice is remembered.
+- **First use downloads models** from a CDN — the OCR engine, plus each language's data the first time you use that language (a few MB each, cached afterwards). OCR needs an internet connection the first time.
+- Accuracy depends on the scan quality — a clean, snug box around the lines you want reads best — and OCR text isn't perfect the way text-layer extraction is, so give it a quick proofread.
 
 ## Installation
 
