@@ -28,6 +28,14 @@ class Plugin extends AppPlugin {
     ];
     this.BACKLINK_HOST = "pdfhl.thymer.local"; // sentinel host we intercept on click
 
+    // OCR fallback for scanned (image-only) pages. tesseract.js is lazy-loaded from
+    // a CDN on first use (the renderer has no CSP; CDN fetch + WASM work — verified).
+    this.TESSERACT_CDN = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
+    this.OCR_TARGET_W = 2550;  // target rendered page width (px) ≈ 300 DPI for a letter page
+    this.OCR_MAX_SCALE = 6;    // cap re-render scale (tiny pages)
+    this.OCR_MAX_DIM = 5000;   // cap region-canvas longest side (memory)
+    this._ocrWorkerPromise = null; // shared tesseract worker (lazy)
+
     this._hooked = new WeakSet();     // iframes already wired
     this._cleanups = [];              // teardown fns
     this._pendingRange = null;        // last good selection range (per active iframe)
@@ -62,10 +70,17 @@ class Plugin extends AppPlugin {
         const d = fr.contentDocument;
         if (!d) return;
         if (d.__pdfhlTeardown) { try { d.__pdfhlTeardown(); } catch (e) {} }
-        d.querySelectorAll(".pdfhl-toolbar, .pdfhl-overlay, #pdfhl-style").forEach((n) => n.remove());
+        d.querySelectorAll(".pdfhl-toolbar, .pdfhl-overlay, .pdfhl-marquee, .pdfhl-menu, #pdfhl-style").forEach((n) => n.remove());
         d.__pdfhlTeardown = null;
       } catch (e) {}
     });
+    // Terminate the OCR worker so hot-reload doesn't leak workers.
+    try {
+      if (this._ocrWorkerPromise) {
+        this._ocrWorkerPromise.then((w) => { try { w && w.terminate && w.terminate(); } catch (e) {} }, () => {});
+        this._ocrWorkerPromise = null;
+      }
+    } catch (e) {}
   }
 
   // =======================================================================
@@ -117,28 +132,49 @@ class Plugin extends AppPlugin {
     if (!doc) return;
     if (doc.__pdfhlTeardown) { try { doc.__pdfhlTeardown(); } catch (e) {} } // drop any stale wiring on this doc first
     const fingerprint = (app.pdfDocument.fingerprints || [])[0] || "unknown";
-    const hook = { iframe, win, doc, app, fingerprint, toolbar: null, overlays: new Map() };
+    const hook = { iframe, win, doc, app, fingerprint, toolbar: null, overlays: new Map(), marquee: null, _pendingRegion: null };
 
     this._injectViewerCSS(doc);
 
-    // Selection -> toolbar (positioned above the selection)
-    const onMouseUp = () => setTimeout(() => this._onSelectionSettled(hook), 0);
-    const onSelDown = (e) => { if (!e.target.closest(".pdfhl-toolbar")) this._hideToolbar(hook); };
-    const onScroll = () => this._hideToolbar(hook);
-    // Reveal a highlight's ✕ only while the cursor is over that highlight's text.
+    // Selection -> toolbar (positioned above the selection). On an image-only
+    // (scanned) page there's nothing to select, so a drag instead draws an OCR
+    // marquee that finalizes into the same colour toolbar.
+    const onMouseUp = (e) => {
+      if (hook.marquee && hook.marquee.active) { this._finishMarquee(hook, e); return; }
+      setTimeout(() => this._onSelectionSettled(hook), 0);
+    };
+    const onSelDown = (e) => {
+      if (e.target.closest && (e.target.closest(".pdfhl-toolbar") || e.target.closest(".pdfhl-menu"))) return;
+      this._hideToolbar(hook);
+      this._closeHighlightMenu(hook); // any click outside the menu dismisses it
+      if (e.button !== 0) return;
+      const pageEl = e.target.closest && e.target.closest(".page");
+      if (pageEl && this._isScannedPage(pageEl)) this._startMarquee(hook, pageEl, e);
+    };
+    const onScroll = () => { this._hideToolbar(hook); this._closeHighlightMenu(hook); };
+    // Right-click a highlight -> context menu (change colour / delete). Replaces the
+    // old hover ✕, which sat outside the highlight and vanished as you reached for it.
+    const onCtx = (e) => {
+      const box = this._boxAtPoint(hook, e.clientX, e.clientY);
+      if (!box) return; // not on a highlight — let the native context menu through
+      e.preventDefault(); e.stopPropagation();
+      this._showHighlightMenu(hook, box.dataset.hid, e.clientX, e.clientY);
+    };
     const onMove = (e) => {
+      if (hook.marquee && hook.marquee.active) { this._updateMarquee(hook, e); return; }
+      // Brighten the highlight under the cursor so it reads as interactive (right-click for options).
       const now = Date.now();
       if (hook._moveAt && now - hook._moveAt < 50) return;
       hook._moveAt = now;
-      const x = e.clientX, y = e.clientY;
-      let hid = null;
-      for (const b of doc.querySelectorAll(".pdfhl-box")) { const r = b.getBoundingClientRect(); if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) { hid = b.dataset.hid; break; } }
-      doc.querySelectorAll(".pdfhl-del").forEach((d) => d.classList.toggle("pdfhl-del-visible", hid != null && d.dataset.hid === hid));
+      const box = this._boxAtPoint(hook, e.clientX, e.clientY);
+      const hid = box ? box.dataset.hid : null;
+      doc.querySelectorAll(".pdfhl-box").forEach((b) => b.classList.toggle("pdfhl-box-hover", hid != null && b.dataset.hid === hid));
     };
     doc.addEventListener("mouseup", onMouseUp, true);
     doc.addEventListener("mousedown", onSelDown, true);
     doc.addEventListener("scroll", onScroll, true);
     doc.addEventListener("mousemove", onMove, true);
+    doc.addEventListener("contextmenu", onCtx, true);
 
     // Redraw stored overlays as pages (re)render. textlayerrendered fires after
     // pagerendered, once the text layer (our positioning reference) exists.
@@ -164,10 +200,13 @@ class Plugin extends AppPlugin {
       try { doc.removeEventListener("mousedown", onSelDown, true); } catch (e) {}
       try { doc.removeEventListener("scroll", onScroll, true); } catch (e) {}
       try { doc.removeEventListener("mousemove", onMove, true); } catch (e) {}
+      try { doc.removeEventListener("contextmenu", onCtx, true); } catch (e) {}
+      try { this._closeHighlightMenu(hook); } catch (e) {}
       try { app.eventBus.off("textlayerrendered", onRendered); } catch (e) {}
       try { app.eventBus.off("pagerendered", onRendered); } catch (e) {}
       try { app.eventBus.off("pagesloaded", onRendered); } catch (e) {}
       try { tlObserver.disconnect(); } catch (e) {}
+      try { this._cancelMarquee(hook); } catch (e) {}
       try { if (hook.toolbar) hook.toolbar.remove(); } catch (e) {}
       try { doc.querySelectorAll(".pdfhl-overlay").forEach((n) => n.remove()); } catch (e) {}
       hook.toolbar = null;
@@ -206,6 +245,7 @@ class Plugin extends AppPlugin {
 
     this._pendingRange = range.cloneRange();
     this._activeHook = hook;
+    hook._pendingRegion = null; // this toolbar is for a text selection, not OCR
     // Bounding box of the selection → toolbar sits centred just above its top.
     let top = Infinity, bottom = -Infinity, left = Infinity, right = -Infinity;
     for (const r of rects) { if (r.top < top) top = r.top; if (r.bottom > bottom) bottom = r.bottom; if (r.left < left) left = r.left; if (r.right > right) right = r.right; }
@@ -225,7 +265,8 @@ class Plugin extends AppPlugin {
         sw.addEventListener("mousedown", (e) => e.preventDefault()); // keep selection
         sw.addEventListener("click", (e) => {
           e.preventDefault(); e.stopPropagation();
-          this._extract(hook, c);
+          if (hook._pendingRegion) this._extractOCR(hook, c);
+          else this._extract(hook, c);
         });
         tb.appendChild(sw);
       }
@@ -259,23 +300,32 @@ class Plugin extends AppPlugin {
       this.ui.addToaster({ title: "Nothing to extract", message: "Select some text in the PDF first.", dismissible: true, autoDestroyTime: 2500 });
       return;
     }
-
     const note = this._findAssociatedNote(hook.iframe);
     if (!note) {
       this.ui.addToaster({ title: "No note found", message: "Open the PDF beside its note, then highlight.", dismissible: true });
       return;
     }
+    await this._commitExtract(hook, note, { paragraphs: data.paragraphs, page: data.page, color, rectsByPage: data.rectsByPage });
+    // Clear selection + toolbar.
+    try { hook.win.getSelection().removeAllRanges(); } catch (e) {}
+    this._hideToolbar(hook);
+    this._pendingRange = null;
+  }
 
-    const quote = data.paragraphs.join("\n\n");
+  // Write an extract into the note as a Thymer QUOTE BLOCK: a "block" line
+  // (blockStyle "quote") whose paragraphs are "text" children, with the backlink
+  // arrow ("p.N" link + ti-arrow-up-right icon) at the end of the last paragraph.
+  // Shared by the text-selection and OCR paths. For OCR, `ocrRect` is the marquee
+  // rectangle (normalised) — it's encoded in the backlink so the overlay is fully
+  // reconstructable from the note alone (a scanned page has no text layer to match).
+  async _commitExtract(hook, note, { paragraphs, page, color, rectsByPage, ocrRect }) {
+    const quote = paragraphs.join("\n\n");
     const hid = "h" + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36);
     const fileGuid = this._currentFileGuid(hook);
-    const backlink = "https://" + this.BACKLINK_HOST + "/open?pdf=" + encodeURIComponent(hook.fingerprint) +
-      "&page=" + data.page + "&color=" + color.key + "&file=" + encodeURIComponent(fileGuid || "") + "&hid=" + hid;
+    let backlink = "https://" + this.BACKLINK_HOST + "/open?pdf=" + encodeURIComponent(hook.fingerprint) +
+      "&page=" + page + "&color=" + color.key + "&file=" + encodeURIComponent(fileGuid || "") + "&hid=" + hid;
+    if (ocrRect) backlink += "&ocr=1&rect=" + [ocrRect.x, ocrRect.y, ocrRect.w, ocrRect.h].map((n) => Number(n).toFixed(4)).join(",");
 
-    // A real Thymer QUOTE BLOCK: a "block" line (blockStyle "quote") whose
-    // paragraphs are "text" children. This groups the whole extract as one block
-    // (no per-paragraph indent vs each other). The backlink arrow sits at the END
-    // of the last paragraph. The block + every child carry the same `hid`.
     let loc;
     try { loc = await this._highlightsParent(note); }
     catch (e) { loc = { parentItem: null, after: null }; }
@@ -285,18 +335,14 @@ class Plugin extends AppPlugin {
       block = await note.createLineItem(loc.parentItem, loc.after, "block");
       if (!block) throw new Error("createLineItem returned null");
       try { block.setBlockStyle("quote"); } catch (e) {}
-      // (line metadata is write-only in Thymer, so identity lives in the backlink
-      //  URL on the last child + the config store, both of which are readable.)
       let prev = null;
-      for (let i = 0; i < data.paragraphs.length; i++) {
+      for (let i = 0; i < paragraphs.length; i++) {
         const p = await note.createLineItem(block, prev, "text");
         if (!p) continue;
-        const isLast = i === data.paragraphs.length - 1;
-        const segs = [{ type: "text", text: data.paragraphs[i] + (isLast ? "  " : "") }];
+        const isLast = i === paragraphs.length - 1;
+        const segs = [{ type: "text", text: paragraphs[i] + (isLast ? "  " : "") }];
         if (isLast) {
-          // Match a Thymer page reference: "p.N" link (underlined) + the Tabler
-          // ti-arrow-up-right icon (NOT underlined), instead of a typed "↗".
-          segs.push({ type: "linkobj", text: { link: backlink, title: "p." + data.page } });
+          segs.push({ type: "linkobj", text: { link: backlink, title: "p." + page } });
           segs.push({ type: "icon", text: "ti-arrow-up-right" });
         }
         p.setSegments(segs);
@@ -304,26 +350,188 @@ class Plugin extends AppPlugin {
       }
     } catch (e) {
       this.ui.addToaster({ title: "Couldn't write extract", message: String(e.message || e), dismissible: true });
-      return;
+      return false;
     }
 
     const firstGuid = (block && (block.guid || (block._getRow && block._getRow().guid))) || null;
-    // Persist for redraw + draw immediately.
-    this._saveHighlight(hook.fingerprint, {
-      hid, page: data.page, color: color.key, rectsByPage: data.rectsByPage,
-      quote: quote, lineGuid: firstGuid,
-    });
+    this._saveHighlight(hook.fingerprint, { hid, page, color: color.key, rectsByPage, quote, lineGuid: firstGuid });
     this._redrawOverlays(hook);
-
-    // Clear selection + toolbar.
-    try { hook.win.getSelection().removeAllRanges(); } catch (e) {}
-    this._hideToolbar(hook);
-    this._pendingRange = null;
-
     this.ui.addToaster({
-      title: "Extracted to note", message: "p." + data.page + " → " + note.getName(),
+      title: "Extracted to note", message: "p." + page + " → " + note.getName(),
       dismissible: true, autoDestroyTime: 2200,
     });
+    return true;
+  }
+
+  // =======================================================================
+  // OCR fallback (scanned pages): drag a marquee -> crop -> Tesseract -> extract
+  // =======================================================================
+  // A page is "scanned" (needs OCR) if its text layer rendered with ~no text.
+  _isScannedPage(pageEl) {
+    try {
+      if (!pageEl.querySelector("canvas")) return false;
+      const tl = pageEl.querySelector(".textLayer");
+      if (!tl) return false; // text layer not built yet — don't hijack the drag
+      const txt = (tl.textContent || "").replace(/\s+/g, "");
+      return txt.length < 8;
+    } catch (e) { return false; }
+  }
+
+  _startMarquee(hook, pageEl, e) {
+    e.preventDefault();
+    const el = hook.doc.createElement("div");
+    el.className = "pdfhl-marquee";
+    hook.doc.body.appendChild(el);
+    hook.marquee = { active: true, pageEl, startX: e.clientX, startY: e.clientY, el };
+    this._updateMarquee(hook, e);
+  }
+
+  _updateMarquee(hook, e) {
+    const m = hook.marquee; if (!m) return;
+    const x = Math.min(m.startX, e.clientX), y = Math.min(m.startY, e.clientY);
+    m.el.style.left = x + "px"; m.el.style.top = y + "px";
+    m.el.style.width = Math.abs(e.clientX - m.startX) + "px";
+    m.el.style.height = Math.abs(e.clientY - m.startY) + "px";
+  }
+
+  _cancelMarquee(hook) {
+    if (hook && hook.marquee) { try { hook.marquee.el && hook.marquee.el.remove(); } catch (e) {} hook.marquee = null; }
+  }
+
+  _finishMarquee(hook, e) {
+    const m = hook.marquee; if (!m) return;
+    const pageEl = m.pageEl;
+    const left = Math.min(m.startX, e.clientX), top = Math.min(m.startY, e.clientY);
+    const right = Math.max(m.startX, e.clientX), bottom = Math.max(m.startY, e.clientY);
+    this._cancelMarquee(hook);
+    if (right - left < 8 || bottom - top < 8) { this._hideToolbar(hook); return; } // a click, not a drag
+    // Normalise against the text layer box (== canvas == page content box).
+    const ref = (pageEl.querySelector(".textLayer") || pageEl.querySelector("canvas")).getBoundingClientRect();
+    if (!ref.width || !ref.height) { this._hideToolbar(hook); return; }
+    const clamp = (v) => Math.max(0, Math.min(1, v));
+    const x = clamp((left - ref.left) / ref.width), y = clamp((top - ref.top) / ref.height);
+    const x2 = clamp((right - ref.left) / ref.width), y2 = clamp((bottom - ref.top) / ref.height);
+    const rect = { x, y, w: Math.max(0, x2 - x), h: Math.max(0, y2 - y) };
+    if (rect.w < 0.01 || rect.h < 0.01) { this._hideToolbar(hook); return; }
+    const page = parseInt(pageEl.getAttribute("data-page-number"), 10) || this._currentPage(hook);
+    hook._pendingRegion = { page, rect };
+    this._pendingRange = null;
+    this._showToolbar(hook, (left + right) / 2, top, bottom);
+  }
+
+  async _extractOCR(hook, color) {
+    const region = hook._pendingRegion;
+    if (!region) return;
+    const note = this._findAssociatedNote(hook.iframe);
+    if (!note) {
+      this.ui.addToaster({ title: "No note found", message: "Open the PDF beside its note, then highlight.", dismissible: true });
+      return;
+    }
+    this._hideToolbar(hook);
+    const prog = this.ui.addToaster({ title: "Running OCR…", message: "Reading text from the highlighted region.", dismissible: false });
+    let text = "";
+    try {
+      text = await this._ocrRegion(hook, region.page, region.rect);
+    } catch (e) {
+      try { prog && prog.destroy(); } catch (_) {}
+      this.ui.addToaster({ title: "OCR failed", message: String((e && e.message) || e), dismissible: true });
+      hook._pendingRegion = null;
+      return;
+    }
+    try { prog && prog.destroy(); } catch (_) {}
+    const paragraphs = this._ocrTextToParagraphs(text);
+    if (!paragraphs.length) {
+      this.ui.addToaster({ title: "No text found", message: "OCR didn't find readable text in that region.", dismissible: true, autoDestroyTime: 2800 });
+      hook._pendingRegion = null;
+      return;
+    }
+    const rectsByPage = {}; rectsByPage[region.page] = [region.rect];
+    await this._commitExtract(hook, note, { paragraphs, page: region.page, color, rectsByPage, ocrRect: region.rect });
+    hook._pendingRegion = null;
+  }
+
+  async _ocrRegion(hook, page, rect) {
+    const canvas = await this._renderRegionCanvas(hook, page, rect);
+    if (!canvas) throw new Error("Couldn't capture that region.");
+    const worker = await this._ensureOcrWorker();
+    const res = await worker.recognize(canvas);
+    return (res && res.data && res.data.text) || "";
+  }
+
+  // Build an OCR-quality bitmap of the region. Preferred: re-render the page region
+  // at ~300 DPI via pdf.js (cheap for a visible page — its image is already decoded —
+  // and independent of the user's zoom). Fallback: crop the already-rendered page
+  // canvas at full backing-store resolution.
+  async _renderRegionCanvas(hook, pageNum, nr) {
+    const pageEl = [...hook.doc.querySelectorAll(".page")].find((p) => parseInt(p.getAttribute("data-page-number"), 10) === pageNum);
+    const src = pageEl && pageEl.querySelector("canvas");
+    try {
+      const page = await hook.app.pdfDocument.getPage(pageNum);
+      const unit = page.getViewport({ scale: 1 });
+      const curScale = src ? src.width / unit.width : 1;
+      let scale = Math.min(this.OCR_MAX_SCALE, Math.max(curScale, this.OCR_TARGET_W / unit.width));
+      let vp = page.getViewport({ scale });
+      const longest = Math.max(nr.w * vp.width, nr.h * vp.height);
+      if (longest > this.OCR_MAX_DIM) { scale *= this.OCR_MAX_DIM / longest; vp = page.getViewport({ scale }); }
+      const rx = nr.x * vp.width, ry = nr.y * vp.height;
+      const rw = Math.round(nr.w * vp.width), rh = Math.round(nr.h * vp.height);
+      if (rw >= 1 && rh >= 1) {
+        const out = document.createElement("canvas");
+        out.width = rw; out.height = rh;
+        const task = page.render({ canvasContext: out.getContext("2d"), viewport: vp, transform: [1, 0, 0, 1, -rx, -ry] });
+        await this._withTimeout(task.promise, 20000);
+        return out;
+      }
+    } catch (e) { /* fall back to existing-canvas crop */ }
+    if (src) {
+      const sx = Math.round(nr.x * src.width), sy = Math.round(nr.y * src.height);
+      const sw = Math.max(1, Math.round(nr.w * src.width)), sh = Math.max(1, Math.round(nr.h * src.height));
+      const out = document.createElement("canvas");
+      out.width = sw; out.height = sh;
+      out.getContext("2d").drawImage(src, sx, sy, sw, sh, 0, 0, sw, sh);
+      return out;
+    }
+    return null;
+  }
+
+  _withTimeout(promise, ms) {
+    return Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error("Timed out.")), ms))]);
+  }
+
+  // Lazy-load tesseract.js from the CDN (script load works; the renderer has no CSP)
+  // and create one reusable worker. Re-armable: a failed init clears the promise.
+  _ensureOcrWorker() {
+    if (this._ocrWorkerPromise) return this._ocrWorkerPromise;
+    this._ocrWorkerPromise = (async () => {
+      if (!window.Tesseract) {
+        await new Promise((resolve, reject) => {
+          const s = document.createElement("script");
+          s.src = this.TESSERACT_CDN;
+          s.onload = resolve;
+          s.onerror = () => reject(new Error("Couldn't load the OCR engine (check your connection)."));
+          document.head.appendChild(s);
+        });
+      }
+      if (!window.Tesseract) throw new Error("OCR engine unavailable.");
+      return await window.Tesseract.createWorker("eng", 1);
+    })();
+    this._ocrWorkerPromise.catch(() => { this._ocrWorkerPromise = null; });
+    return this._ocrWorkerPromise;
+  }
+
+  // OCR text -> paragraphs: split on blank lines, collapse intra-paragraph line
+  // breaks to spaces, de-hyphenate wrapped words.
+  _ocrTextToParagraphs(text) {
+    if (!text) return [];
+    return text.replace(/\r/g, "")
+      .split(/\n[ \t]*\n+/)
+      .map((para) => para.split("\n").map((l) => l.trim()).filter(Boolean).reduce((acc, line) => {
+        if (!acc) return line;
+        if (/[‐-―-]$/.test(acc) && /^[a-zà-ÿ]/.test(line)) return acc.replace(/[‐-―-]$/, "") + line;
+        return acc + " " + line;
+      }, ""))
+      .map((p) => p.replace(/\s+/g, " ").trim())
+      .filter(Boolean);
   }
 
   // Reconstruct multi-line / multi-paragraph text from text-layer geometry,
@@ -626,6 +834,80 @@ class Plugin extends AppPlugin {
     tick();
   }
 
+  // The highlight box (if any) under a point in the viewer's client coords.
+  _boxAtPoint(hook, x, y) {
+    for (const b of hook.doc.querySelectorAll(".pdfhl-box")) {
+      const r = b.getBoundingClientRect();
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return b;
+    }
+    return null;
+  }
+
+  // Right-click menu for a highlight: a row of colour swatches (change colour) + Delete.
+  _showHighlightMenu(hook, hid, x, y) {
+    this._closeHighlightMenu(hook);
+    const doc = hook.doc;
+    const hl = (this._getStore()[hook.fingerprint] || []).find((h) => h.hid === hid);
+    const curColor = hl ? hl.color : null;
+    const menu = doc.createElement("div");
+    menu.className = "pdfhl-menu";
+    const row = doc.createElement("div");
+    row.className = "pdfhl-menu-swatches";
+    for (const c of this.COLORS) {
+      const sw = doc.createElement("button");
+      sw.className = "pdfhl-swatch" + (c.key === curColor ? " pdfhl-swatch-current" : "");
+      sw.style.background = "rgb(" + c.rgb + ")";
+      sw.title = c.label;
+      sw.addEventListener("mousedown", (e) => e.preventDefault());
+      sw.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); this._closeHighlightMenu(hook); this._changeHighlightColor(hook, hid, c.key); });
+      row.appendChild(sw);
+    }
+    menu.appendChild(row);
+    const del = doc.createElement("div");
+    del.className = "pdfhl-menu-item pdfhl-menu-delete";
+    del.textContent = "Delete highlight";
+    del.addEventListener("mousedown", (e) => e.preventDefault());
+    del.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); this._closeHighlightMenu(hook); this._deleteHighlight(hook, hid); });
+    menu.appendChild(del);
+    doc.body.appendChild(menu);
+    // Position at the cursor, clamped to the viewport.
+    const pad = 8, W = menu.offsetWidth || 160, H = menu.offsetHeight || 84;
+    menu.style.left = Math.max(pad, Math.min(x, hook.win.innerWidth - W - pad)) + "px";
+    menu.style.top = Math.max(pad, Math.min(y, hook.win.innerHeight - H - pad)) + "px";
+    hook._menu = menu;
+  }
+
+  _closeHighlightMenu(hook) {
+    try { if (hook && hook._menu) { hook._menu.remove(); hook._menu = null; } } catch (e) {}
+  }
+
+  // Recolour an existing highlight: the in-memory store, the overlay, AND the colour
+  // param in the note's backlink URL (so a later rebuild-from-note keeps the change).
+  async _changeHighlightColor(hook, hid, colorKey) {
+    const store = this._getStore();
+    const hl = (store[hook.fingerprint] || []).find((h) => h.hid === hid);
+    if (hl) { hl.color = colorKey; this._setStore(store); }
+    this._redrawOverlays(hook);
+    try {
+      const note = this._findAssociatedNote(hook.iframe);
+      if (!note) return;
+      const items = (await note.getLineItems()) || [];
+      for (const li of items) {
+        const segs = li.segments || [];
+        const hasLink = segs.some((s) => s && s.type === "linkobj" && s.text && typeof s.text.link === "string" && s.text.link.indexOf("hid=" + hid) !== -1);
+        if (!hasLink) continue;
+        const newSegs = segs.map((s) => {
+          if (s.type === "linkobj" && s.text && typeof s.text.link === "string" && s.text.link.indexOf("hid=" + hid) !== -1) {
+            return { type: "linkobj", text: { link: s.text.link.replace(/([?&]color=)[^&]+/, "$1" + colorKey), title: s.text.title } };
+          }
+          return { type: s.type, text: s.text };
+        });
+        try { li.setSegments(newSegs); } catch (e) {}
+        break;
+      }
+    } catch (e) {}
+  }
+
   async _deleteHighlight(hook, hid) {
     const store = this._getStore();
     if (store[hook.fingerprint]) {
@@ -738,13 +1020,20 @@ class Plugin extends AppPlugin {
       const paragraphs = kids
         .map((k) => (k.li.segments || []).filter((s) => s.type !== "linkobj").map((s) => (typeof s.text === "string" ? s.text : "")).join(""))
         .map((t) => t.trim()).filter(Boolean);
-      hls.push({ hid, page, color, paragraphs });
+      const ocr = u.searchParams.get("ocr") === "1";
+      let rect = null;
+      const rstr = u.searchParams.get("rect");
+      if (rstr) { const a = rstr.split(",").map(Number); if (a.length === 4 && a.every((n) => !isNaN(n))) rect = { x: a[0], y: a[1], w: a[2], h: a[3] }; }
+      hls.push({ hid, page, color, paragraphs, ocr, rect });
     }
 
     // locate rects for each, on whatever page is currently rendered; keep prior rects otherwise
     const prior = this._getStore()[hook.fingerprint] || [];
     const result = hls.map((h) => {
       let rectsByPage = {};
+      // OCR highlights carry their (single) overlay rect in the backlink URL — a
+      // scanned page has no text layer to locate text in, so use it directly.
+      if (h.ocr && h.rect) { rectsByPage[h.page] = [h.rect]; return { hid: h.hid, page: h.page, color: h.color, rectsByPage }; }
       const pageEl = [...hook.doc.querySelectorAll(".page")].find((p) => parseInt(p.getAttribute("data-page-number"), 10) === h.page);
       if (pageEl && pageEl.querySelector(".textLayer")) {
         const rects = [];
@@ -825,17 +1114,6 @@ class Plugin extends AppPlugin {
             "background:rgba(" + rgb + ",0.40);";
           layer.appendChild(box);
         }
-        // Delete affordance: a small ✕ floating just above the start of the highlight.
-        const f0 = rects[0];
-        const del = doc.createElement("div");
-        del.className = "pdfhl-del";
-        del.dataset.hid = h.hid || "";
-        del.textContent = "✕";
-        del.title = "Delete highlight";
-        del.style.cssText = "left:" + (f0.x * 100) + "%;top:" + (f0.y * 100) + "%;";
-        del.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); });
-        del.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); this._deleteHighlight(hook, h.hid); });
-        layer.appendChild(del);
       }
     });
   }
@@ -889,11 +1167,16 @@ class Plugin extends AppPlugin {
       ".pdfhl-box{position:absolute;border-radius:2px;mix-blend-mode:multiply;}",
       ".pdfhl-box.pdfhl-pulse{animation:pdfhl-pulse .9s ease-out 2;}",
       "@keyframes pdfhl-pulse{0%{outline:0 solid rgba(0,0,0,0);}40%{outline:3px solid rgba(0,0,0,.55);}100%{outline:0 solid rgba(0,0,0,0);}}",
-      ".pdfhl-del{position:absolute;transform:translate(-50%,-115%);width:16px;height:16px;border-radius:50%;",
-      "background:#1f1f1f;color:#fff;font-size:10px;line-height:16px;text-align:center;cursor:pointer;",
-      "pointer-events:none;opacity:0;z-index:5;user-select:none;transition:opacity .12s;}",
-      ".pdfhl-del.pdfhl-del-visible{opacity:.85;pointer-events:auto;}",
-      ".pdfhl-del.pdfhl-del-visible:hover{opacity:1;background:#d83a3a;}",
+      ".pdfhl-box-hover{outline:2px solid rgba(31,31,31,.55);}",
+      ".pdfhl-marquee{position:fixed;z-index:2147483646;border:1.5px dashed rgba(31,31,31,.9);",
+      "background:rgba(31,31,31,.10);pointer-events:none;border-radius:2px;}",
+      ".pdfhl-menu{position:fixed;z-index:2147483647;background:#1f1f1f;border-radius:10px;padding:8px;",
+      "box-shadow:0 6px 24px rgba(0,0,0,.45);min-width:150px;}",
+      ".pdfhl-menu .pdfhl-menu-swatches{display:flex;gap:6px;padding:2px 2px 8px;justify-content:space-between;}",
+      ".pdfhl-menu .pdfhl-swatch-current{box-shadow:0 0 0 2px #1f1f1f,0 0 0 4px #fff;}",
+      ".pdfhl-menu-item{color:#fff;font:13px/1.4 system-ui,sans-serif;padding:7px 8px;border-radius:6px;cursor:pointer;}",
+      ".pdfhl-menu-item:hover{background:rgba(255,255,255,.12);}",
+      ".pdfhl-menu-delete:hover{background:#d83a3a;}",
     ].join("");
     doc.head.appendChild(s);
   }
