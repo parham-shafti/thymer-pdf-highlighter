@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.2.0 — 2026-06-15
+
+- **Now works in the browser version of Thymer.** Highlights and their coloured overlays were saved correctly but never re-drawn in the web app, so they only showed up in the desktop app. They now render identically in both — OCR highlights included.
+- **More precise selections.** Selecting text that starts or ends mid-line no longer pulls in the surrounding words; only what you actually selected is extracted.
+
 ## v2.1.0 — 2026-06-14
 
 - **Highlight in one step.** Selecting text (or finishing an OCR box) now applies your current colour instantly — no colour toolbar to click each time. Right-click a highlight to recolour it (which also sets the colour for new ones).

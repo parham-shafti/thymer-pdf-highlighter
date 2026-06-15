@@ -52,6 +52,7 @@ class Plugin extends AppPlugin {
     this._cmds = []; // registered command-palette commands (removed on teardown)
 
     this._hooked = new WeakSet();     // iframes already wired
+    this._storeCache = null;          // in-session source of truth for the highlight store; the config round-trip (getConfiguration/saveConfiguration) does NOT reflect writes in the web client, so reads must not depend on it
     this._cleanups = [];              // teardown fns
     this._pendingRange = null;        // last good selection range (per active iframe)
     this._activeHook = null;          // the hook ctx whose selection is live
@@ -624,6 +625,22 @@ class Plugin extends AppPlugin {
 
   // Reconstruct multi-line / multi-paragraph text from text-layer geometry,
   // and collect normalised highlight rects per page.
+  // Clip a text-layer span's text to the part actually inside the selection.
+  // pdf.js textLayer spans are single-text-node, and a mid-span selection lands
+  // its start/end boundary INSIDE that text node — so only the two boundary spans
+  // get trimmed; fully-selected interior spans (and geometric-only bullet spans,
+  // whose boundary lives elsewhere) keep their whole text. Without this, selecting
+  // mid-sentence captured the leading/trailing text of the first/last line because
+  // the entire span was taken.
+  _clipSpanText(range, span) {
+    const tn = span.firstChild;
+    if (!tn || tn.nodeType !== 3 || span.childNodes.length !== 1) return span.textContent;
+    let from = 0, to = tn.length;
+    if (range.startContainer === tn) from = range.startOffset;
+    if (range.endContainer === tn) to = range.endOffset;
+    return tn.textContent.slice(from, to);
+  }
+
   _extractStructured(hook, range) {
     const doc = hook.doc;
     // Collect text-layer spans GEOMETRICALLY (those whose centre falls inside the
@@ -642,7 +659,7 @@ class Plugin extends AppPlugin {
         // catches out-of-DOM-order spans (bullets); intersectsNode catches the
         // height-0 heading spans the geometry misses. Neither alone is enough.
         if (!inSel(r) && !range.intersectsNode(span)) return;
-        spans.push({ pageNum, text: span.textContent, top: r.top, bottom: r.bottom || (r.top + 8), left: r.left, right: r.right, height: r.height || 8 });
+        spans.push({ pageNum, text: this._clipSpanText(range, span), top: r.top, bottom: r.bottom || (r.top + 8), left: r.left, right: r.right, height: r.height || 8 });
       });
     });
     if (!spans.length) {
@@ -1107,8 +1124,13 @@ class Plugin extends AppPlugin {
       const color = u.searchParams.get("color") || "yellow";
       const it = li._getItem && li._getItem();
       const kids = (kidsByBlock[(it && it.pguid)] || [{ li }]).slice().sort((a, b) => (a.oind || 0) - (b.oind || 0));
+      // Only TEXT segments form the quote we match back against the PDF. The block's
+      // last line also carries a "linkobj" (backlink) and an "icon" segment whose text
+      // is the literal icon name ("ti-arrow-up-right") — including either would corrupt
+      // the locate needle so _locateText finds nothing. On desktop a failed locate falls
+      // back to the stored rects; on web there's no such store, so the overlay vanishes.
       const paragraphs = kids
-        .map((k) => (k.li.segments || []).filter((s) => s.type !== "linkobj").map((s) => (typeof s.text === "string" ? s.text : "")).join(""))
+        .map((k) => (k.li.segments || []).filter((s) => s.type === "text").map((s) => (typeof s.text === "string" ? s.text : "")).join(""))
         .map((t) => t.trim()).filter(Boolean);
       const ocr = u.searchParams.get("ocr") === "1";
       let rects = null;
@@ -1212,14 +1234,22 @@ class Plugin extends AppPlugin {
   }
 
   // Highlight store lives in the plugin configuration custom blob.
+  // The store is kept in memory (this._storeCache) as the in-session source of
+  // truth, seeded ONCE from the persisted config. In the web client getConfiguration()
+  // does not reflect just-written saveConfiguration() data, so reading the store back
+  // from config (as this used to) returned empty there — _redrawOverlays then saw no
+  // highlights and wiped every overlay. The note text remains the durable cross-session
+  // source (see _rebuildFromNote), which repopulates this cache on load.
   _getStore() {
+    if (this._storeCache) return this._storeCache;
     try {
       const conf = this.getConfiguration();
-      conf.custom = conf.custom || {};
-      return conf.custom.pdfhl_highlights || {};
-    } catch (e) { return {}; }
+      this._storeCache = (conf && conf.custom && conf.custom.pdfhl_highlights) || {};
+    } catch (e) { this._storeCache = {}; }
+    return this._storeCache;
   }
   _setStore(store) {
+    this._storeCache = store; // authoritative for this session
     try {
       const conf = this.getConfiguration();
       conf.custom = conf.custom || {};
