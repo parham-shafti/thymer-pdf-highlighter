@@ -48,7 +48,17 @@ class Plugin extends AppPlugin {
     ];
     this._ocrLang = "eng";
     this._hlColor = "yellow"; // remembered highlight colour, auto-applied to new highlights
-    try { const conf = this.getConfiguration(); if (conf && conf.custom) { if (conf.custom.ocrLang) this._ocrLang = conf.custom.ocrLang; if (conf.custom.hlColor) this._hlColor = conf.custom.hlColor; } } catch (e) {}
+    this._useHeading = true;  // group extracts under a "Highlights" heading (toggleable)
+    this._lastNoteLineGuid = null; // last note line clicked — insertion point when the heading is off
+    try { const conf = this.getConfiguration(); if (conf && conf.custom) { if (conf.custom.ocrLang) this._ocrLang = conf.custom.ocrLang; if (conf.custom.hlColor) this._hlColor = conf.custom.hlColor; if (conf.custom.useHeading === false) this._useHeading = false; } } catch (e) {}
+    // saveConfiguration writes don't round-trip back into getConfiguration in the web
+    // client, so the heading toggle also persists in localStorage (reliable on desktop
+    // and web, survives reload). Read after config so it wins.
+    try {
+      const v = window.localStorage.getItem("pdfhl_useHeading"); if (v === "0") this._useHeading = false; else if (v === "1") this._useHeading = true;
+      const lc = window.localStorage.getItem("pdfhl_hlColor"); if (lc) this._hlColor = lc;
+      const ll = window.localStorage.getItem("pdfhl_ocrLang"); if (ll) this._ocrLang = ll;
+    } catch (e) {}
     this._cmds = []; // registered command-palette commands (removed on teardown)
 
     this._hooked = new WeakSet();     // iframes already wired
@@ -69,8 +79,15 @@ class Plugin extends AppPlugin {
     // Hook any PDF viewer already open.
     this._scanForViewers();
 
-    // One command-palette command per OCR language (sets it for scanned-page OCR).
     try {
+      // Toggle grouping extracts under a "Highlights" heading vs dropping them at the cursor.
+      // Listed FIRST, before the OCR language commands.
+      this._cmds.push(this.ui.addCommandPaletteCommand({
+        label: "PDF Highlighter: Toggle Highlights heading",
+        icon: "ti-heading",
+        onSelected: () => this._setUseHeading(!this._useHeading),
+      }));
+      // Then one command-palette command per OCR language (sets it for scanned-page OCR).
       for (const L of this.OCR_LANGUAGES) {
         this._cmds.push(this.ui.addCommandPaletteCommand({
           label: "PDF Highlighter: " + L.label,
@@ -79,6 +96,31 @@ class Plugin extends AppPlugin {
         }));
       }
     } catch (e) {}
+
+    // Track the last note line the user clicked, so "heading off" can insert there.
+    // Thymer's custom caret/input layer often intercepts the click target, so fall
+    // back to geometric hit-testing (which line's box contains the click point).
+    const onNoteClick = (e) => {
+      try {
+        let li = e.target.closest && e.target.closest(".listitem-text[data-guid], .listitem-heading[data-guid]");
+        if (!li) {
+          // Geometric fallback: the SMALLEST line box containing the click point
+          // (the leaf text/heading line, not an enclosing block/quote container).
+          const x = e.clientX, y = e.clientY;
+          let bestArea = Infinity;
+          for (const it of document.querySelectorAll(".listview-items .listitem[data-guid]")) {
+            const r = it.getBoundingClientRect();
+            if (r.width && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom && r.width * r.height < bestArea) { li = it; bestArea = r.width * r.height; }
+          }
+        }
+        if (li) this._lastNoteLineGuid = li.getAttribute("data-guid");
+      } catch (er) {}
+    };
+    // pointerdown is the one Thymer's editor actually uses for caret placement (and a
+    // preventDefault there can suppress the compat mousedown) — listen for both.
+    document.addEventListener("pointerdown", onNoteClick, true);
+    document.addEventListener("mousedown", onNoteClick, true);
+    this._cleanups.push(() => { try { document.removeEventListener("pointerdown", onNoteClick, true); document.removeEventListener("mousedown", onNoteClick, true); } catch (e) {} });
 
     // Functional (not debug): the next instance calls this on hot-reload to fully
     // tear down this one, so stale listeners never accumulate. See onLoad top.
@@ -170,7 +212,10 @@ class Plugin extends AppPlugin {
     // marquee that finalizes into the same colour toolbar.
     const onMouseUp = (e) => {
       if (hook.marquee && hook.marquee.active) { this._finishMarquee(hook, e); return; }
-      setTimeout(() => this._onSelectionSettled(hook), 0);
+      // Modifier held while selecting picks the extract style: ⌘ = append to the
+      // previous block, ⌥ = empty note-link line (write your own note), none = quote.
+      const mode = e.metaKey ? "append" : (e.altKey ? "link" : "normal");
+      setTimeout(() => this._onSelectionSettled(hook, mode), 0);
     };
     const onSelDown = (e) => {
       if (e.target.closest && e.target.closest(".pdfhl-menu")) return;
@@ -267,7 +312,7 @@ class Plugin extends AppPlugin {
   // =======================================================================
   // Selection -> floating colour toolbar
   // =======================================================================
-  _onSelectionSettled(hook) {
+  _onSelectionSettled(hook, mode) {
     const sel = hook.win.getSelection();
     if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
     const range = sel.getRangeAt(0);
@@ -281,7 +326,7 @@ class Plugin extends AppPlugin {
     this._pendingRange = range.cloneRange();
     this._activeHook = hook;
     hook._pendingRegion = null;
-    this._extract(hook, this._currentColor());
+    this._extract(hook, this._currentColor(), mode || "normal");
   }
 
   // The remembered highlight colour, auto-applied to new highlights.
@@ -291,6 +336,7 @@ class Plugin extends AppPlugin {
   _setHlColor(key) {
     if (!this.COLORS.some((c) => c.key === key)) return;
     this._hlColor = key;
+    try { window.localStorage.setItem("pdfhl_hlColor", key); } catch (e) {} // config doesn't round-trip on reload here
     try {
       const conf = this.getConfiguration();
       conf.custom = conf.custom || {};
@@ -307,7 +353,7 @@ class Plugin extends AppPlugin {
   // =======================================================================
   // Extraction
   // =======================================================================
-  async _extract(hook, color) {
+  async _extract(hook, color, mode) {
     const range = this._pendingRange;
     if (!range) return;
     const data = this._extractStructured(hook, range);
@@ -320,7 +366,7 @@ class Plugin extends AppPlugin {
       this.ui.addToaster({ title: "No note found", message: "Open the PDF beside its note, then highlight.", dismissible: true });
       return;
     }
-    await this._commitExtract(hook, note, { paragraphs: data.paragraphs, page: data.page, color, rectsByPage: data.rectsByPage });
+    await this._commitExtract(hook, note, { paragraphs: data.paragraphs, page: data.page, color, rectsByPage: data.rectsByPage, mode: mode || "normal" });
     // Clear selection + toolbar.
     try { hook.win.getSelection().removeAllRanges(); } catch (e) {}
     this._hideToolbar(hook);
@@ -333,42 +379,85 @@ class Plugin extends AppPlugin {
   // Shared by the text-selection and OCR paths. For OCR, `ocrRects` are the marquee
   // rectangles (normalised, one per box) — encoded in the backlink so the overlay is
   // fully reconstructable from the note alone (a scanned page has no text layer to match).
-  async _commitExtract(hook, note, { paragraphs, page, color, rectsByPage, ocrRects }) {
+  async _commitExtract(hook, note, { paragraphs, page, color, rectsByPage, ocrRects, mode }) {
+    mode = mode || "normal";
     const quote = paragraphs.join("\n\n");
     const hid = "h" + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36);
     const fileGuid = this._currentFileGuid(hook);
+    const encRects = (rs) => rs.map((r) => [r.x, r.y, r.w, r.h].map((n) => Number(n).toFixed(4)).join(",")).join(";");
     let backlink = "https://" + this.BACKLINK_HOST + "/open?pdf=" + encodeURIComponent(hook.fingerprint) +
       "&page=" + page + "&color=" + color.key + "&file=" + encodeURIComponent(fileGuid || "") + "&hid=" + hid;
-    if (ocrRects && ocrRects.length) backlink += "&ocr=1&rect=" + ocrRects.map((r) => [r.x, r.y, r.w, r.h].map((n) => Number(n).toFixed(4)).join(",")).join(";");
+    if (ocrRects && ocrRects.length) backlink += "&ocr=1&rect=" + encRects(ocrRects);
+    // A note-link has no quote text to locate back in the PDF, so it carries its overlay
+    // rect(s) in the URL — recovered directly on rebuild, the same way OCR highlights are.
+    else if (mode === "link") {
+      const lr = (rectsByPage && rectsByPage[page]) || [];
+      if (lr.length) backlink += "&link=1&rect=" + encRects(lr);
+    }
+
+    // APPEND (⌘): add these paragraphs into the previous quote block instead of a new one.
+    if (mode === "append") {
+      const tgt = await this._resolveAppendTarget(note, hook.fingerprint);
+      if (tgt) {
+        try { await this._writeParagraphs(note, tgt.block, tgt.after, paragraphs, backlink, page); }
+        catch (e) { this.ui.addToaster({ title: "Couldn't append", message: String(e.message || e), dismissible: true }); return false; }
+        this._saveHighlight(hook.fingerprint, { hid, page, color: color.key, rectsByPage, quote, lineGuid: this._lastBlockGuid });
+        this._redrawOverlays(hook);
+        this.ui.addToaster({ title: "Added to block", message: "p." + page + " → " + note.getName(), dismissible: true, autoDestroyTime: 2000 });
+        return true;
+      }
+      mode = "normal"; // nothing to append to yet — start a fresh block
+    }
 
     let loc;
-    try { loc = await this._highlightsParent(note); }
+    try { loc = await this._insertLocation(note); }
     catch (e) { loc = { parentItem: null, after: null }; }
 
+    // NOTE-LINK (⌥): an empty "note"-styled BLOCK to write your own note in, carrying just
+    // the backlink (no extracted text). The overlay box is recovered from the URL rects.
+    if (mode === "link") {
+      let block = null;
+      try {
+        block = await note.createLineItem(loc.parentItem, loc.after, "block");
+        if (!block) throw new Error("createLineItem returned null");
+        try { block.setBlockStyle("note"); } catch (e) {}
+        // An empty line first to write the note in, then the backlink line below it.
+        const noteLine = await note.createLineItem(block, null, "text");
+        if (noteLine) noteLine.setSegments([{ type: "text", text: "" }]);
+        const li = await note.createLineItem(block, noteLine, "text");
+        if (!li) throw new Error("createLineItem returned null");
+        li.setSegments([
+          { type: "text", text: "  " },
+          { type: "linkobj", text: { link: backlink, title: "p." + page } },
+          { type: "icon", text: "ti-arrow-up-right" },
+        ]);
+        if (!loc.parentItem) await this._moveBlockAfter(block, loc.after); // records prepend top-level inserts → place after the caret line / end
+      } catch (e) {
+        this.ui.addToaster({ title: "Couldn't add note", message: String(e.message || e), dismissible: true });
+        return false;
+      }
+      const blkGuid = (block && (block.guid || (block._getRow && block._getRow().guid))) || null;
+      this._saveHighlight(hook.fingerprint, { hid, page, color: color.key, rectsByPage, quote: "", lineGuid: blkGuid });
+      this._redrawOverlays(hook);
+      this.ui.addToaster({ title: "Note added", message: "p." + page + " → write your note", dismissible: true, autoDestroyTime: 2200 });
+      return true;
+    }
+
+    // NORMAL: a new quote block.
     let block = null;
     try {
       block = await note.createLineItem(loc.parentItem, loc.after, "block");
       if (!block) throw new Error("createLineItem returned null");
       try { block.setBlockStyle("quote"); } catch (e) {}
-      let prev = null;
-      for (let i = 0; i < paragraphs.length; i++) {
-        const p = await note.createLineItem(block, prev, "text");
-        if (!p) continue;
-        const isLast = i === paragraphs.length - 1;
-        const segs = [{ type: "text", text: paragraphs[i] + (isLast ? "  " : "") }];
-        if (isLast) {
-          segs.push({ type: "linkobj", text: { link: backlink, title: "p." + page } });
-          segs.push({ type: "icon", text: "ti-arrow-up-right" });
-        }
-        p.setSegments(segs);
-        prev = p;
-      }
+      await this._writeParagraphs(note, block, null, paragraphs, backlink, page);
+      if (!loc.parentItem) await this._moveBlockAfter(block, loc.after); // records prepend top-level inserts → place after the caret line / end
     } catch (e) {
       this.ui.addToaster({ title: "Couldn't write extract", message: String(e.message || e), dismissible: true });
       return false;
     }
 
     const firstGuid = (block && (block.guid || (block._getRow && block._getRow().guid))) || null;
+    this._lastBlockGuid = firstGuid; // the block ⌘-append adds into
     this._saveHighlight(hook.fingerprint, { hid, page, color: color.key, rectsByPage, quote, lineGuid: firstGuid });
     this._redrawOverlays(hook);
     this.ui.addToaster({
@@ -376,6 +465,72 @@ class Plugin extends AppPlugin {
       dismissible: true, autoDestroyTime: 2200,
     });
     return true;
+  }
+
+  // Write paragraphs as "text" children under `parent` (after `afterLi`); the last one
+  // carries the backlink arrow ("p.N" link + ti-arrow-up-right icon). Shared by the
+  // new-block (normal) and append paths.
+  async _writeParagraphs(note, parent, afterLi, paragraphs, backlink, page) {
+    let prev = afterLi || null;
+    for (let i = 0; i < paragraphs.length; i++) {
+      const p = await note.createLineItem(parent, prev, "text");
+      if (!p) continue;
+      const isLast = i === paragraphs.length - 1;
+      const segs = [{ type: "text", text: paragraphs[i] + (isLast ? "  " : "") }];
+      if (isLast) {
+        segs.push({ type: "linkobj", text: { link: backlink, title: "p." + page } });
+        segs.push({ type: "icon", text: "ti-arrow-up-right" });
+      }
+      p.setSegments(segs);
+      prev = p;
+    }
+  }
+
+  // In record-type notes, createLineItem(null, after) ignores the anchor and prepends the
+  // new top-level block at the top (all items share oind 0). move() DOES honour the anchor,
+  // so reposition the block to sit right after its intended anchor — the caret line (heading
+  // off) or the last body line (end). No-op if move() is unavailable or there's no anchor.
+  async _moveBlockAfter(block, after) {
+    try {
+      if (!block || typeof block.move !== "function" || !after) return;
+      await block.move(null, after);
+    } catch (e) {}
+  }
+
+  // The block ⌘-append should add into: the last normal extract's quote block (tracked in
+  // _lastBlockGuid), plus the line to insert after. Null if it's gone (note reloaded /
+  // deleted) — the caller then starts a fresh block.
+  async _resolveAppendTarget(note, fingerprint) {
+    try {
+      const items = (await note.getLineItems()) || [];
+      const rows = items.map((li) => ({ li, row: (li._getItem && li._getItem()) || {} }));
+      const targetBlock = (blockGuid) => {
+        if (!blockGuid) return null;
+        const block = rows.find((x) => x.row.guid === blockGuid);
+        if (!block) return null;
+        const kids = rows.filter((x) => x.row.pguid === blockGuid).sort((a, b) => (a.row.oind || 0) - (b.row.oind || 0));
+        return { block: block.li, after: kids.length ? kids[kids.length - 1].li : null };
+      };
+      // Primary: the block tracked from the last normal extract this session.
+      const tracked = targetBlock(this._lastBlockGuid);
+      if (tracked) return tracked;
+      // Fallback (block moved/indented so its guid changed, or lost after reload): the
+      // quote-extract block carrying the most-recent highlight for this PDF. `hid` is
+      // "h"+base36(Date.now())+… so a lexicographic max ≈ most recently created. Note-links
+      // (link=1) are skipped — they're not append targets.
+      let bestHid = "", bestPguid = null;
+      for (const x of rows) {
+        let segs = []; try { segs = x.li.segments || []; } catch (e) {}
+        const link = segs.find((s) => s && s.type === "linkobj" && s.text && typeof s.text.link === "string" && s.text.link.indexOf(this.BACKLINK_HOST) !== -1);
+        if (!link) continue;
+        let u; try { u = new URL(link.text.link); } catch (e) { continue; }
+        if (fingerprint && u.searchParams.get("pdf") !== fingerprint) continue;
+        if (u.searchParams.get("link") === "1") continue;
+        const hid = u.searchParams.get("hid") || "";
+        if (hid && hid > bestHid) { bestHid = hid; bestPguid = x.row.pguid; }
+      }
+      return targetBlock(bestPguid);
+    } catch (e) { return null; }
   }
 
   // =======================================================================
@@ -397,7 +552,7 @@ class Plugin extends AppPlugin {
     const el = hook.doc.createElement("div");
     el.className = "pdfhl-marquee";
     hook.doc.body.appendChild(el);
-    hook.marquee = { active: true, pageEl, startX: e.clientX, startY: e.clientY, el, shift: !!e.shiftKey };
+    hook.marquee = { active: true, pageEl, startX: e.clientX, startY: e.clientY, el, shift: !!e.shiftKey, mode: e.metaKey ? "append" : (e.altKey ? "link" : "normal") };
     this._updateMarquee(hook, e);
   }
 
@@ -415,12 +570,19 @@ class Plugin extends AppPlugin {
 
   _finishMarquee(hook, e) {
     const m = hook.marquee; if (!m) return;
-    const pageEl = m.pageEl, el = m.el, wasShift = m.shift;
+    const pageEl = m.pageEl, el = m.el, wasShift = m.shift, mode = m.mode || "normal";
     const left = Math.min(m.startX, e.clientX), top = Math.min(m.startY, e.clientY);
     const right = Math.max(m.startX, e.clientX), bottom = Math.max(m.startY, e.clientY);
     hook.marquee = null; // detach; `el` is managed directly below
     const drop = () => { try { el.remove(); } catch (er) {} };
-    if (right - left < 8 || bottom - top < 8) { drop(); return; } // a click, not a drag
+    if (right - left < 8 || bottom - top < 8) { // a click, not a drag
+      drop();
+      // A wide-but-flat drag on an image page is usually a (futile) text-selection attempt.
+      if (mode === "normal" && right - left >= 40 && bottom - top < 8) {
+        this.ui.addToaster({ title: "No selectable text here", message: "This page is an image — drag a box around the text to capture it.", dismissible: true, autoDestroyTime: 3500 });
+      }
+      return;
+    }
     // Normalise against the text layer box (== canvas == page content box).
     const ref = (pageEl.querySelector(".textLayer") || pageEl.querySelector("canvas")).getBoundingClientRect();
     if (!ref.width || !ref.height) { drop(); return; }
@@ -433,22 +595,44 @@ class Plugin extends AppPlugin {
     if (wasShift) {
       // Accumulate this box (keep it outlined); commit them all on Shift release.
       el.classList.add("pdfhl-marquee-pending");
-      (hook._ocrBoxes = hook._ocrBoxes || []).push({ page, rect, el });
+      (hook._ocrBoxes = hook._ocrBoxes || []).push({ page, rect, el, mode });
+    } else if (mode === "link") {
+      // ⌥ note-link on an image region: no OCR, just an empty linked line + overlay box.
+      drop();
+      this._pendingRange = null;
+      this._commitRegionLink(hook, page, [rect], this._currentColor());
     } else {
       drop();
-      hook._pendingRegion = { page, rect };
+      hook._pendingRegion = { page, rect, mode }; // mode carries ⌘ (append) through OCR
       this._pendingRange = null;
       this._extractOCR(hook, this._currentColor());
     }
   }
 
-  // Shift released -> OCR every accumulated box together as one extract.
+  // ⌥ note-link on image region(s): skip OCR entirely; create an empty "note" block carrying
+  // just the backlink, whose overlay box(es) are the marquee rect(s) (carried in the URL).
+  async _commitRegionLink(hook, page, rects, color) {
+    const note = this._findAssociatedNote(hook.iframe);
+    if (!note) { this.ui.addToaster({ title: "No note found", message: "Open the PDF beside its note, then highlight.", dismissible: true }); return; }
+    await this._commitExtract(hook, note, { paragraphs: [], page, color, rectsByPage: { [page]: rects }, mode: "link" });
+  }
+
+  // Shift released -> commit every accumulated box together as ONE extract, honouring a
+  // ⌘ (append) or ⌥ (note block) held during the boxing.
   _commitOcrBoxes(hook) {
     const boxes = hook._ocrBoxes || [];
     if (!boxes.length) return;
     hook._ocrBoxes = [];
     boxes.forEach((b) => { try { b.el.remove(); } catch (e) {} });
-    this._ocrAndExtract(hook, boxes.map((b) => ({ page: b.page, rect: b.rect })), this._currentColor());
+    const mode = boxes.map((b) => b.mode).find((m) => m && m !== "normal") || "normal";
+    if (mode === "link") {
+      // ⌥: a single note block linked to all the boxes, no OCR.
+      const page = boxes[0].page;
+      const rects = boxes.filter((b) => b.page === page).map((b) => b.rect);
+      this._commitRegionLink(hook, page, rects, this._currentColor());
+    } else {
+      this._ocrAndExtract(hook, boxes.map((b) => ({ page: b.page, rect: b.rect })), this._currentColor(), mode);
+    }
   }
 
   // Esc -> discard the pending boxes without extracting.
@@ -462,13 +646,13 @@ class Plugin extends AppPlugin {
     const region = hook._pendingRegion;
     if (!region) return;
     hook._pendingRegion = null;
-    await this._ocrAndExtract(hook, [region], color);
+    await this._ocrAndExtract(hook, [region], color, region.mode || "normal");
   }
 
   // OCR one or more boxed regions (sorted into reading order), combine the text, and
   // write a single extract. Multiple regions come from Shift-boxing several lines, so
   // you can start mid-sentence and skip the ragged ends.
-  async _ocrAndExtract(hook, regions, color) {
+  async _ocrAndExtract(hook, regions, color, mode) {
     regions = (regions || []).filter((r) => r && r.rect);
     if (!regions.length) return;
     const note = this._findAssociatedNote(hook.iframe);
@@ -498,7 +682,7 @@ class Plugin extends AppPlugin {
     for (const r of sorted) (rectsByPage[r.page] = rectsByPage[r.page] || []).push(r.rect);
     const page = sorted[0].page;
     const ocrRects = sorted.filter((r) => r.page === page).map((r) => r.rect);
-    await this._commitExtract(hook, note, { paragraphs, page, color, rectsByPage, ocrRects });
+    await this._commitExtract(hook, note, { paragraphs, page, color, rectsByPage, ocrRects, mode: mode || "normal" });
   }
 
   // Join per-box OCR text (each box ≈ a line/fragment) into one flowing passage,
@@ -604,6 +788,7 @@ class Plugin extends AppPlugin {
     const L = this.OCR_LANGUAGES.find((x) => x.code === code);
     if (code !== this._ocrLang) {
       this._ocrLang = code;
+      try { window.localStorage.setItem("pdfhl_ocrLang", code); } catch (e) {} // config doesn't round-trip on reload here
       // Persist alongside the highlight store (don't clobber it).
       try {
         const conf = this.getConfiguration();
@@ -784,6 +969,48 @@ class Plugin extends AppPlugin {
   _isHighlightsHeading(li) {
     try { const it = li._getItem && li._getItem(); if (it && it.kv && it.kv.pdfhl_heading) return true; } catch (e) {}
     try { return (li.segments || []).map((s) => (typeof s.text === "string" ? s.text : "")).join("").trim().toLowerCase() === "highlights"; } catch (e) { return false; }
+  }
+
+  // Toggle whether extracts are grouped under a "Highlights" heading.
+  _setUseHeading(on) {
+    this._useHeading = !!on;
+    try { window.localStorage.setItem("pdfhl_useHeading", on ? "1" : "0"); } catch (e) {}
+    try {
+      const conf = this.getConfiguration();
+      conf.custom = conf.custom || {};
+      conf.custom.useHeading = !!on;
+      const mine = (this.data.getAllGlobalPlugins() || []).find((g) => g.guid === this.getGuid());
+      if (mine && typeof mine.saveConfiguration === "function") mine.saveConfiguration(conf);
+    } catch (e) {}
+    this.ui.addToaster({
+      title: "Highlights heading " + (on ? "on" : "off"),
+      message: on ? "New extracts are grouped under a Highlights heading." : "New extracts go after the line you last clicked in the note.",
+      dismissible: true, autoDestroyTime: 3200,
+    });
+  }
+
+  // Where a new extract goes: under the Highlights heading (default), or — when that's
+  // toggled off — after the last note line the user clicked (else the end of the note).
+  async _insertLocation(note) {
+    if (this._useHeading) return await this._highlightsParent(note);
+    return await this._cursorLocation(note);
+  }
+
+  async _cursorLocation(note) {
+    try {
+      const items = (await note.getLineItems()) || [];
+      const rows = items.map((li) => ({ li, row: (li._getItem && li._getItem()) || {} }));
+      const byGuid = {}; rows.forEach((x) => { if (x.row.guid) byGuid[x.row.guid] = x; });
+      const cur = this._lastNoteLineGuid ? byGuid[this._lastNoteLineGuid] : null;
+      if (cur && cur.row.type !== "document") {
+        // Insert as a sibling right after the clicked line: same parent, after = it.
+        // (A top-level line's pguid is the record root, so parentItem is null — same
+        //  parent+after pattern _highlightsParent uses to append under a heading.)
+        const parent = cur.row.pguid ? byGuid[cur.row.pguid] : null;
+        return { parentItem: parent ? parent.li : null, after: cur.li };
+      }
+    } catch (e) {}
+    return { parentItem: null, after: await this._lastContentItem(note) };
   }
 
   // Find-or-create the "Highlights" heading; return where to insert the next extract
@@ -1033,27 +1260,39 @@ class Plugin extends AppPlugin {
     this.ui.addToaster({ title: "Highlight deleted", dismissible: true, autoDestroyTime: 1500 });
   }
 
-  // Locate the quote block + its children for a highlight, via the `hid` carried in
-  // the backlink URL on the last child (line metadata isn't readable). Children are
+  // Lines to delete for one highlight, via the `hid` carried in the backlink URL (line
+  // metadata isn't readable). A block can hold SEVERAL highlights (⌘-append), so delete
+  // only THIS highlight's run — the paragraph lines up to and including its backlink line —
+  // and remove the block itself only when this was the last highlight in it. Children are
   // returned before the block so deletion never orphans a child.
   async _findHighlightLines(note, hid) {
     const items = (await note.getLineItems()) || [];
+    const byGuid = {};
+    items.forEach((li) => { const g = ((li._getItem && li._getItem()) || {}).guid; if (g) byGuid[g] = li; });
     const hasHidLink = (li) => {
       let segs = []; try { segs = li.segments || []; } catch (e) {}
       return segs.some((s) => s && s.type === "linkobj" && s.text && typeof s.text.link === "string" && s.text.link.indexOf("hid=" + hid) !== -1);
     };
+    const hasAnyBacklink = (li) => {
+      let segs = []; try { segs = li.segments || []; } catch (e) {}
+      return segs.some((s) => s && s.type === "linkobj" && s.text && typeof s.text.link === "string" && s.text.link.indexOf(this.BACKLINK_HOST) !== -1);
+    };
     const anchor = items.find(hasHidLink);
     if (!anchor) return [];
-    let blockGuid = null;
-    try { blockGuid = (anchor._getItem && anchor._getItem().pguid) || null; } catch (e) {}
-    if (!blockGuid) return [anchor];
-    const children = [], blocks = [];
-    for (const li of items) {
-      const it = (li._getItem && li._getItem()) || {};
-      if (it.pguid === blockGuid) children.push(li);
-      else if (it.guid === blockGuid) blocks.push(li);
-    }
-    return children.concat(blocks);
+    const blockGuid = ((anchor._getItem && anchor._getItem()) || {}).pguid || null;
+    const block = blockGuid ? byGuid[blockGuid] : null;
+    if (!block) return [anchor]; // a lone line (not inside a block) — just delete it
+    // Children in document order via the block's cguids (oind is uniformly 0 in records).
+    let kids = (((block._getItem && block._getItem()) || {}).cguids || []).map((g) => byGuid[g]).filter(Boolean);
+    if (!kids.length) kids = items.filter((li) => (((li._getItem && li._getItem()) || {}).pguid) === blockGuid);
+    // Segment into runs, each ending at a backlink line; pick the run containing the anchor.
+    const runs = []; let cur = [];
+    for (const li of kids) { cur.push(li); if (hasAnyBacklink(li)) { runs.push(cur); cur = []; } }
+    if (cur.length) runs.push(cur);
+    const target = runs.find((run) => run.indexOf(anchor) !== -1) || [anchor];
+    const highlightRuns = runs.filter((run) => run.some(hasAnyBacklink));
+    if (highlightRuns.length <= 1) return target.concat([block]); // last one → take the block too
+    return target; // other highlights remain → keep the block
   }
 
   // Drop store entries whose extract was deleted from the note (note → overlay sync).
@@ -1105,50 +1344,54 @@ class Plugin extends AppPlugin {
     let items;
     try { items = (await note.getLineItems()) || []; } catch (e) { return; }
 
-    // children grouped by their parent block (for the paragraph texts)
-    const kidsByBlock = {};
+    // Group children by parent. A highlight is a RUN of sibling lines ending at the line
+    // that carries the backlink: a normal extract is a quote block whose one run is all
+    // its children; an APPENDED block holds several runs (a backlink each); a note-link is
+    // a lone line with a backlink and no quote text. Only TEXT segments form the quote we
+    // match back against the PDF — the "linkobj" (backlink) and the "icon" segment (whose
+    // text is the literal "ti-arrow-up-right") would corrupt the _locateText needle.
+    const childrenByParent = {};
     for (const li of items) {
       const it = li._getItem && li._getItem();
-      if (it && it.pguid) (kidsByBlock[it.pguid] = kidsByBlock[it.pguid] || []).push({ li, oind: it.oind || 0 });
+      if (it && it.pguid) (childrenByParent[it.pguid] = childrenByParent[it.pguid] || []).push({ li, oind: it.oind || 0 });
     }
-    // parse the extracts (backlink-bearing lines) for THIS pdf
+    const textOf = (li) => (li.segments || []).filter((s) => s.type === "text").map((s) => (typeof s.text === "string" ? s.text : "")).join("").trim();
+    const backlinkOf = (li) => (li.segments || []).find((s) => s && s.type === "linkobj" && s.text && typeof s.text.link === "string" && s.text.link.indexOf(this.BACKLINK_HOST) !== -1);
     const seen = new Set(), hls = [];
-    for (const li of items) {
-      const segs = li.segments || [];
-      const link = segs.find((s) => s && s.type === "linkobj" && s.text && typeof s.text.link === "string" && s.text.link.indexOf(this.BACKLINK_HOST) !== -1);
-      if (!link) continue;
-      let u; try { u = new URL(link.text.link); } catch (e) { continue; }
-      if (u.searchParams.get("pdf") !== hook.fingerprint) continue;
-      const hid = u.searchParams.get("hid"); if (!hid || seen.has(hid)) continue; seen.add(hid);
-      const page = parseInt(u.searchParams.get("page"), 10) || 1;
-      const color = u.searchParams.get("color") || "yellow";
-      const it = li._getItem && li._getItem();
-      const kids = (kidsByBlock[(it && it.pguid)] || [{ li }]).slice().sort((a, b) => (a.oind || 0) - (b.oind || 0));
-      // Only TEXT segments form the quote we match back against the PDF. The block's
-      // last line also carries a "linkobj" (backlink) and an "icon" segment whose text
-      // is the literal icon name ("ti-arrow-up-right") — including either would corrupt
-      // the locate needle so _locateText finds nothing. On desktop a failed locate falls
-      // back to the stored rects; on web there's no such store, so the overlay vanishes.
-      const paragraphs = kids
-        .map((k) => (k.li.segments || []).filter((s) => s.type === "text").map((s) => (typeof s.text === "string" ? s.text : "")).join(""))
-        .map((t) => t.trim()).filter(Boolean);
-      const ocr = u.searchParams.get("ocr") === "1";
-      let rects = null;
-      const rstr = u.searchParams.get("rect");
-      if (rstr) {
-        rects = rstr.split(";").map((s) => s.split(",").map(Number)).filter((a) => a.length === 4 && a.every((n) => !isNaN(n))).map((a) => ({ x: a[0], y: a[1], w: a[2], h: a[3] }));
-        if (!rects.length) rects = null;
+    for (const pg in childrenByParent) {
+      const kids = childrenByParent[pg].slice().sort((a, b) => (a.oind || 0) - (b.oind || 0));
+      let run = []; // paragraph texts accumulated since the last backlink
+      for (const k of kids) {
+        const t = textOf(k.li);
+        if (t) run.push(t);
+        const link = backlinkOf(k.li);
+        if (!link) continue;
+        const paragraphs = run.slice(); run = []; // close this highlight's run
+        let u; try { u = new URL(link.text.link); } catch (e) { continue; }
+        if (u.searchParams.get("pdf") !== hook.fingerprint) continue;
+        const hid = u.searchParams.get("hid"); if (!hid || seen.has(hid)) continue; seen.add(hid);
+        const page = parseInt(u.searchParams.get("page"), 10) || 1;
+        const color = u.searchParams.get("color") || "yellow";
+        const ocr = u.searchParams.get("ocr") === "1";
+        const isLink = u.searchParams.get("link") === "1";
+        let rects = null;
+        const rstr = u.searchParams.get("rect");
+        if (rstr) {
+          rects = rstr.split(";").map((s) => s.split(",").map(Number)).filter((a) => a.length === 4 && a.every((n) => !isNaN(n))).map((a) => ({ x: a[0], y: a[1], w: a[2], h: a[3] }));
+          if (!rects.length) rects = null;
+        }
+        hls.push({ hid, page, color, paragraphs, ocr, link: isLink, rects });
       }
-      hls.push({ hid, page, color, paragraphs, ocr, rects });
     }
 
     // locate rects for each, on whatever page is currently rendered; keep prior rects otherwise
     const prior = this._getStore()[hook.fingerprint] || [];
     const result = hls.map((h) => {
       let rectsByPage = {};
-      // OCR highlights carry their overlay rect(s) in the backlink URL — a scanned
-      // page has no text layer to locate text in, so use them directly.
-      if (h.ocr && h.rects) { rectsByPage[h.page] = h.rects; return { hid: h.hid, page: h.page, color: h.color, rectsByPage }; }
+      // OCR and note-link highlights carry their overlay rect(s) in the backlink URL —
+      // a scanned page has no text layer, and a note-link has no quote text, so the
+      // passage can't be located; use the stored rects directly.
+      if ((h.ocr || h.link) && h.rects) { rectsByPage[h.page] = h.rects; return { hid: h.hid, page: h.page, color: h.color, rectsByPage }; }
       const pageEl = [...hook.doc.querySelectorAll(".page")].find((p) => parseInt(p.getAttribute("data-page-number"), 10) === h.page);
       if (pageEl && pageEl.querySelector(".textLayer")) {
         const rects = [];
@@ -1254,6 +1497,11 @@ class Plugin extends AppPlugin {
       const conf = this.getConfiguration();
       conf.custom = conf.custom || {};
       conf.custom.pdfhl_highlights = store;
+      // Re-assert settings from in-memory state so a stale getConfiguration() can't drop
+      // them when this store write saves (was clobbering the heading toggle).
+      conf.custom.useHeading = this._useHeading;
+      conf.custom.hlColor = this._hlColor;
+      conf.custom.ocrLang = this._ocrLang;
       const mine = (this.data.getAllGlobalPlugins() || []).find((g) => g.guid === this.getGuid());
       if (mine && typeof mine.saveConfiguration === "function") mine.saveConfiguration(conf);
     } catch (e) {}

@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.3.0 — 2026-06-20
+
+- **Collect several passages into one quote.** Hold **⌘** while selecting text (or finishing an OCR box) to **append** it to your previous extract instead of starting a new quote block. A quote block can now hold many highlights, and you can delete them individually — deleting one no longer removes the whole block.
+- **Link a note you write yourself.** Hold **⌥** while selecting (or boxing) to drop an empty **Note block** linked to that spot in the PDF — a clean line to write your own note, above the `p.N ↗` backlink, with no extracted text.
+- **Combine with Shift on scanned pages.** **Shift + ⌘** OCRs several boxes and appends them into the previous block; **Shift + ⌥** turns several boxes into one note block.
+- **Choose where extracts land.** A new Command Palette command, **PDF Highlighter: Toggle Highlights heading**, switches between grouping extracts under the **Highlights** heading and dropping them at the end of the note.
+- **Settings persist.** Your colour, OCR language, and the heading setting are now remembered across reloads.
+- **Fixes.** Extracts now cascade in order in collection/record notes (they had been stacking at the top), and a clearer message appears when you try to select text on an image-only page.
+
 ## v2.2.0 — 2026-06-15
 
 - **Now works in the browser version of Thymer.** Highlights and their coloured overlays were saved correctly but never re-drawn in the web app, so they only showed up in the desktop app. They now render identically in both — OCR highlights included.
