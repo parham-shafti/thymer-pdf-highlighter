@@ -28,7 +28,7 @@ A compact rail floats over the left edge of the PDF panel. Each button shows wha
 
 **Text** marks the selection, and holds two independent choices that combine:
 
-![Highlight, underline, strikethrough or area capture, as a citation or a comment](screenshots/text-menu.png)
+![Highlight, underline, strikethrough or area capture, as a citation or a comment](screenshots/text-tools.png)
 
 - **Highlight**, **Underline** and **Strikethrough** decide how the PDF is marked. A strikethrough files its note in a **warning** block.
 - **Area** swaps text-selection for a box: drag over a column or a whole paragraph and the text inside is captured. On a page with real text that is exact, character for character; on a scanned page the same drag runs OCR instead.
@@ -36,13 +36,13 @@ A compact rail floats over the left edge of the PDF panel. Each button shows wha
 
 **Shapes** draws over the page. Every shape writes a note block with a line to say why it's there:
 
-![Rectangle, ellipse, line, arrow and freehand](screenshots/shapes-menu.png)
+![Rectangle, ellipse, line, arrow and freehand](screenshots/shape-tools.png)
 
 With the **Select** arrow, click a shape to select it, drag it to move it, drag a handle to resize it, and press **Delete** to remove it.
 
 **Style** sets colour, fill, line type, thickness and opacity — for new marks, or for whatever you have selected:
 
-![Colour, fill, line type, thickness and opacity](screenshots/style-panel.png)
+![Colour, fill, line type, thickness and opacity](screenshots/style.png)
 
 Right-click any shape or highlight to open the same panel at the cursor, with a delete button. The **?** button lists every gesture, in case you forget one.
 
