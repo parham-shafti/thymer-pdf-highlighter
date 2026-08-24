@@ -1,1 +1,4 @@
 .DS_Store
+
+# Design canvas working files (not part of the plugin)
+design/

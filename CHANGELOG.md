@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.4.0 — 2026-08-24
+
+- **A tool rail over the PDF.** Four compact buttons — Select, Text, Shapes and Style — each showing what it will do. A click uses the tool; its menu opens from the button's bottom edge or a right-click.
+- **Underline and strikethrough**, alongside highlighting. A strikethrough files its note in a **warning** block.
+- **Area capture.** Drag a box over a column or a paragraph instead of selecting it line by line. On a page with real text the capture is exact, character for character; on a scanned page the same drag runs OCR.
+- **Citation or Comment.** Every text mark can either quote the passage or give you an empty block to write your own note in — combined freely with highlight, underline, strikethrough or area.
+- **Draw on the page.** Rectangles, ellipses, lines, arrows and freehand, with colour, fill, line type (solid, dashed, dotted, dash-dot), thickness and opacity. Select a shape to move it, drag its handles to resize it, and press Delete to remove it. Every shape writes a note block with a line to say why it's there.
+- **⌘ now merges.** Holding ⌘ while selecting folds the passage into your previous quote, so a passage broken across ragged line ends becomes one citation with a single backlink. Merging stops at a page break, where one link could only point at one of the pages.
+- **Captured lists become real lists.** A bullet or numbered list arrives as Thymer list items rather than text that happens to start with a bullet — including from OCR, which rarely reads a bullet glyph as one.
+- **Better OCR structure.** Line breaks and paragraphs survive: the recognised text is rebuilt from Tesseract's own line boxes instead of being flattened into one run-on paragraph.
+- **It follows your theme.** The rail, menus and panels use Thymer's colours, and a selected shape is outlined in your theme's accent.
+- **A shortcuts panel** behind the **?** button, listing every gesture.
+- **Fixes.** Highlight colour no longer washes over the text it marks; a highlighted sentence is one continuous band instead of a box per word; a selection that starts or ends mid-line no longer pulls in the surrounding words.
+
 ## v2.3.0 — 2026-06-20
 
 - **Collect several passages into one quote.** Hold **⌘** while selecting text (or finishing an OCR box) to **append** it to your previous extract instead of starting a new quote block. A quote block can now hold many highlights, and you can delete them individually — deleting one no longer removes the whole block.

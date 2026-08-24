@@ -2,6 +2,8 @@
 
 PDF Highlighter is a [Thymer](https://thymer.com) plugin for highlighting text in a PDF attached to a note and pulling it straight into the note. Open a PDF and select a passage, and the text lands in your note as a colour-coded quote, grouped under a **Highlights** heading and tagged with a clickable backlink to the exact page. Click the backlink any time to jump back into the PDF, where the plugin scrolls to the passage and pulses your highlight. The highlight stays painted over the text in the PDF too, and survives reloads.
 
+**There's a tool rail for the rest of it.** Underline and strike text, capture a whole region in one drag, draw rectangles, ellipses, lines, arrows and freehand over the page, and write your own comment instead of a quote. Everything you mark lands in the note, so the note is always the record of what you did.
+
 **Scanned PDFs work too.** On an image-only page (no selectable text), drag a box around the text instead of selecting it; the plugin runs OCR on that region and drops the recognised text into your note with the same colour, backlink, and overlay.
 
 It works by hooking Thymer's own built-in PDF preview (which is [PDF.js](https://mozilla.github.io/pdf.js/) under the hood), so there's no second viewer to load and nothing to slow down — your PDF opens beside your note exactly as it always does, just with highlighting added.
@@ -14,22 +16,47 @@ It works by hooking Thymer's own built-in PDF preview (which is [PDF.js](https:/
 2. **Open it** — click the attached PDF. Thymer opens it in a preview panel next to the note.
 3. **Highlight** — select some text and it's instantly highlighted in your current colour and added to the note's **Highlights** section as a quote block, ending with a `p.N ↗` backlink. No picking a colour each time; it uses your current one (yellow to start), and you can recolour afterwards.
 
-   - **Collect into one quote** — hold **⌘** while selecting (or finishing an OCR box) to **append** the passage to your previous extract instead of starting a new quote block. Keep going to gather several passages into a single quote; each one keeps its own page backlink, and you can delete them individually.
-   - **Write your own note** — hold **⌥** while selecting (or boxing) to drop an empty **Note block** linked to that spot in the PDF — a clean line to write your own note, above the backlink, with no extracted text. Click into it and type.
+   - **Collect into one quote** — hold **⌘** while selecting to merge the passage into your previous quote. The block keeps **one** citation with a single backlink at the end, so gathering a passage that breaks across ragged line ends reads as one quotation. (Merging stops at a page break, where a single link could only point at one of the pages.)
+   - **Write your own note** — hold **⌥** while selecting to drop an empty **note block** linked to that spot in the PDF, with no extracted text. Click into it and type.
 
 4. **Jump back** — click the `p.N ↗` link (or its arrow) on any extract. The PDF jumps to that page and pulses the highlight. If the PDF is closed, it reopens beside the note first.
-5. **Recolour or delete** — right-click a highlight in the PDF. A small menu appears: pick a different colour to recolour it (updated in both the PDF and the note, and it becomes the default for new highlights), or **Delete highlight** to remove it along with its extract from the note.
+5. **Restyle or delete** — right-click a highlight or a shape in the PDF. The style panel opens at the cursor: change its colour (and for an underline or strikethrough, its weight), or delete it along with its entry in the note.
+
+### The tool rail
+
+A compact rail floats over the left edge of the PDF panel. Each button shows what it will do, and its menu opens from the button's bottom edge or a right-click — a plain click just uses the tool.
+
+**Text** marks the selection, and holds two independent choices that combine:
+
+![Highlight, underline, strikethrough or area capture, as a citation or a comment](screenshots/text-menu.png)
+
+- **Highlight**, **Underline** and **Strikethrough** decide how the PDF is marked. A strikethrough files its note in a **warning** block.
+- **Area** swaps text-selection for a box: drag over a column or a whole paragraph and the text inside is captured. On a page with real text that is exact, character for character; on a scanned page the same drag runs OCR instead.
+- **Citation** puts the quoted passage in the note. **Comment** gives you an empty block to write in.
+
+**Shapes** draws over the page. Every shape writes a note block with a line to say why it's there:
+
+![Rectangle, ellipse, line, arrow and freehand](screenshots/shapes-menu.png)
+
+With the **Select** arrow, click a shape to select it, drag it to move it, drag a handle to resize it, and press **Delete** to remove it.
+
+**Style** sets colour, fill, line type, thickness and opacity — for new marks, or for whatever you have selected:
+
+![Colour, fill, line type, thickness and opacity](screenshots/style-panel.png)
+
+Right-click any shape or highlight to open the same panel at the cursor, with a delete button. The **?** button lists every gesture, in case you forget one.
 
 **On a scanned (image-only) page** there's no text to select, so instead **drag a box** around the text you want. The plugin OCRs that region (first use downloads the recognition engine, which takes a moment) and adds the recognised text to your note in your current colour, with the same backlink, overlay, and delete. Drawing a snug box around just the lines you want gives the cleanest result.
 
 Good to know:
 
-- **Five colours.** New highlights use your current colour (yellow to start); right-click any highlight to recolour it, and that colour becomes the default for new ones. (Mapping colours to meanings is on the roadmap.)
-- **Multi-line and multi-paragraph extracts** are preserved — headings stay on their own line, bullet lists stay multiline, and wrapped lines flow back together into clean paragraphs.
+- **Colours.** Five for highlights, eight for shapes (a shape outline wants black and white; a highlight doesn't). Right-click anything to recolour it, and that colour becomes the default for new ones.
+- **Structure is preserved.** Headings stay on their own line, wrapped lines flow back into clean paragraphs, and a captured list becomes a real Thymer list rather than text that happens to start with a bullet.
 - **Highlights persist.** They're reconstructed from the note's text, so they come back after a reload even if the PDF was closed — as long as the note is open beside the PDF.
 - **Lossless text on real PDFs.** When a page has a text layer, the plugin reads the actual characters, so the extracted text is exact (no OCR errors). Scanned pages fall back to OCR automatically.
 - **Group under a heading, or not.** Extracts sit under a **Highlights** heading by default. Run **PDF Highlighter: Toggle Highlights heading** from the Command Palette (`Cmd+P` / `Ctrl+P`) to instead drop new extracts at the end of the note.
-- **Your settings are remembered** across reloads — your colour, OCR language, and the heading setting.
+- **Your settings are remembered** across reloads — colours, line type, thickness, opacity, OCR language, the text mode and the heading setting.
+- **It follows your theme.** The rail, menus and panels use Thymer's own colours, and a selected shape is outlined in your theme's accent, so it fits whichever of Thymer's themes you use.
 
 ## Scanned PDFs (OCR)
 
@@ -39,7 +66,7 @@ Pages that are just images (scans, photographed documents) have no text layer to
 - The boxed region is rendered at high resolution straight from the page and run through [Tesseract](https://github.com/naptha/tesseract.js), entirely on your machine — nothing is uploaded.
 - The recognised text is added to your note exactly like a normal highlight: same colours, backlink, coloured overlay, and delete.
 - **Multi-line capture.** To grab a passage that starts mid-sentence or skips ragged line-ends, **hold Shift and drag a box on each piece** (end of one line, the next line, part of a third); release Shift and they're OCR'd together into one extract. **Esc** discards the pending boxes.
-- **Append or note-link a boxed passage.** The same **⌘** (append to your previous extract) and **⌥** (empty note block) modifiers work while boxing, and combine with Shift — **Shift + ⌘** OCRs several boxes into your previous block, **Shift + ⌥** turns them into one note block.
+- **Merge or comment a boxed passage.** The same **⌘** (merge into your previous quote) and **⌥** (empty note block) modifiers work while boxing, and combine with Shift. They're read when you *release* the mouse, so you can scroll first and press the key just before letting go.
 
 Good to know:
 
