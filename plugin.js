@@ -376,6 +376,31 @@ class Plugin extends AppPlugin {
     };
     // Shift+drag boxes accumulate; releasing Shift OCRs them all as one extract. Esc discards.
     const onKeyUp = (e) => { if (e.key === "Shift") this._commitOcrBoxes(hook); };
+    // The viewer's own toolbar download saves the ORIGINAL bytes, silently — the one thing a
+    // user who has just marked up the PDF does not expect. Both arrows now do the same thing.
+    // Capture on the document runs before pdf.js's own handler on the button.
+    const NATIVE_DL = "#download, #downloadButton, #secondaryDownload, #secondaryDownloadButton, " +
+      'button[title="Save"], button[title="Download"], button[data-l10n-id="pdfjs-save-button"], button[data-l10n-id="pdfjs-download-button"]';
+    const onNativeDownload = (e) => {
+      const b = e.target && e.target.closest && e.target.closest(NATIVE_DL);
+      if (!b) return;
+      e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+      this._exportAnnotatedPdf(hook);
+    };
+    doc.addEventListener("click", onNativeDownload, true);
+    // Thymer's OWN toolbar (the ◁ n/N ▷ · zoom · rotate · download · print strip) lives in
+    // Thymer's document above the iframe, not inside pdf.js: a plain minimal button whose
+    // only mark is its ti-download icon. Scope it to the panel holding THIS viewer.
+    const onPanelDownload = (e) => {
+      const btn = e.target && e.target.closest && e.target.closest("button");
+      if (!btn || !btn.querySelector(".ti-download")) return;
+      let panel = hook.iframe && hook.iframe.parentElement;
+      while (panel && panel !== document.body && !panel.querySelector(".id--panel-title, .panel-tab--title")) panel = panel.parentElement;
+      if (!panel || panel === document.body || !panel.contains(btn)) return;
+      e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+      this._exportAnnotatedPdf(hook);
+    };
+    document.addEventListener("click", onPanelDownload, true);
     const onKeyDown = (e) => {
       // Bound to the VIEWER only: in the note, ⌘Z stays Thymer's own undo.
       if ((e.metaKey || e.ctrlKey) && String(e.key).toLowerCase() === "z") {
@@ -443,6 +468,8 @@ class Plugin extends AppPlugin {
       try { doc.removeEventListener("contextmenu", onCtx, true); } catch (e) {}
       try { doc.removeEventListener("keyup", onKeyUp, true); } catch (e) {}
       try { doc.removeEventListener("keydown", onKeyDown, true); } catch (e) {}
+      try { doc.removeEventListener("click", onNativeDownload, true); } catch (e) {}
+      try { document.removeEventListener("click", onPanelDownload, true); } catch (e) {}
       try { window.removeEventListener("keyup", onKeyUp, true); } catch (e) {}
       try { this._closeHighlightMenu(hook); } catch (e) {}
       try { app.eventBus.off("textlayerrendered", onRendered); } catch (e) {}
@@ -1037,31 +1064,70 @@ class Plugin extends AppPlugin {
       if (collected.items.some((i) => i.shape && i.shape.type === "text")) {
         font = await doc.embedFont(PDFLib.StandardFonts.Helvetica);
       }
-      let drawn = 0;
+      // Nothing here fails silently: a mark that can't be drawn is counted and its error
+      // kept, so the toast can say WHY a file came out unmarked instead of "Exported 0".
+      let drawn = 0, failed = 0, firstErr = null;
       for (const item of collected.items) {
         const page = pages[(item.page || 1) - 1];
-        if (!page) continue;
+        if (!page) {
+          failed++;
+          if (!firstErr) firstErr = new Error("page " + item.page + " is not in the file (" + pages.length + " pages)");
+          continue;
+        }
         try {
           item.font = font;
           this._drawExportItem(PDFLib, page, this._pdfPageGeom(PDFLib, page), item);
           drawn++;
-        } catch (e) {}
+        } catch (e) { failed++; if (!firstErr) firstErr = e; }
+      }
+      try { prog && prog.destroy(); } catch (e) {}
+      const total = collected.items.length;
+      const plural = (n) => n + " mark" + (n === 1 ? "" : "s");
+      if (!drawn) {
+        // Don't hand over an unmarked copy — say what happened instead.
+        const why = !total
+          ? (collected.missing
+              ? plural(collected.missing) + " have no position yet. Scroll through their pages once, then export again."
+              : "No marks were found for this PDF.")
+          : String((firstErr && (firstErr.message || firstErr)) || "unknown reason");
+        this.ui.addToaster({ title: "Nothing was exported", message: why, dismissible: true });
+        return;
       }
       const out = await doc.save();
-      const base = String((hook.app._title || hook.doc.title || "document")).replace(/\.pdf$/i, "") || "document";
+      const base = this._pdfDisplayName(hook).replace(/\.pdf$/i, "") || "document";
       this._downloadBlob(new Blob([out], { type: "application/pdf" }), base + " (annotated).pdf");
-      try { prog && prog.destroy(); } catch (e) {}
+      const notes = [];
+      if (failed) notes.push(plural(failed) + " failed: " + String((firstErr && (firstErr.message || firstErr)) || "unknown"));
+      if (collected.missing) notes.push(plural(collected.missing) + " on pages you haven't opened were skipped. Scroll through them and export again.");
       this.ui.addToaster({
-        title: "Exported " + drawn + " mark" + (drawn === 1 ? "" : "s"),
-        message: collected.missing
-          ? collected.missing + " on pages you haven't opened were skipped — scroll through them and export again."
-          : "Saved beside your downloads as a new PDF.",
-        dismissible: true, autoDestroyTime: collected.missing ? 6000 : 3200,
+        title: "Exported " + drawn + " of " + plural(total),
+        message: notes.length ? notes.join(" ") : "Saved beside your downloads as a new PDF.",
+        dismissible: true, autoDestroyTime: notes.length ? 7000 : 3200,
       });
     } catch (e) {
       try { prog && prog.destroy(); } catch (er) {}
       this.ui.addToaster({ title: "Export failed", message: String((e && e.message) || e), dismissible: true });
     }
+  }
+
+  // The document's own name. The desktop app puts the filename in the viewer title; the web
+  // client leaves it at the generic "PDF.js viewer", so there we read the PDF panel's own
+  // heading. Walking UP from the iframe to the first ancestor that holds a panel title keeps
+  // it scoped to this panel — the note beside it has a title of its own. (Verified on web.)
+  _pdfDisplayName(hook) {
+    try {
+      const t = hook.app && hook.app._title;
+      if (t && /\.pdf$/i.test(String(t).trim())) return String(t).trim();
+    } catch (e) {}
+    try {
+      let a = hook.iframe && hook.iframe.parentElement;
+      while (a && a !== document.body && !a.querySelector(".id--panel-title, .panel-tab--title")) a = a.parentElement;
+      const el = a && a !== document.body && (a.querySelector(".id--panel-title") || a.querySelector(".panel-tab--title"));
+      const t = el && String(el.textContent || "").trim();
+      if (t && /\.pdf$/i.test(t)) return t;
+    } catch (e) {}
+    try { const t = hook.doc && hook.doc.title; if (t && /\.pdf$/i.test(t)) return String(t).trim(); } catch (e) {}
+    return "document";
   }
 
   _downloadBlob(blob, filename) {

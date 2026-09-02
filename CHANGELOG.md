@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.5.1 — 2026-09-02
+
+- **Both download arrows now export your markup.** The PDF viewer's own download button used to save the original file, silently and without markup, while the plugin's export lived in the tool rail. Now either one gives you the annotated PDF.
+- **No more silent unmarked copies.** If nothing could be drawn, the export stops and tells you why instead of handing you a file that looks like the original. When only some marks fail, it says how many and what went wrong.
+- **Correct filename in the browser.** The web client named the file "PDF.js viewer (annotated).pdf"; it now uses the document's own name, as the desktop app already did.
+
 ## v2.5.0 — 2026-09-02
 
 - **Export an annotated PDF.** The download button in the tool rail saves a copy of the PDF with your markup drawn into it. It's written as real vector objects, not a flattened image, so the text stays selectable and searchable and it prints correctly from any reader.
