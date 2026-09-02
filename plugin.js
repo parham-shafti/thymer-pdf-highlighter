@@ -30,6 +30,8 @@ class Plugin extends AppPlugin {
 
     // OCR fallback for scanned (image-only) pages. tesseract.js is lazy-loaded from
     // a CDN on first use (the renderer has no CSP; CDN fetch + WASM work — verified).
+    this.PDFLIB_CDN = "https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js";
+    this._hooks = [];           // live viewers, so a palette command can find one
     this.TESSERACT_CDN = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
     this.OCR_TARGET_W = 2550;  // target rendered page width (px) ≈ 300 DPI for a letter page
     this.OCR_MAX_SCALE = 6;    // cap re-render scale (tiny pages)
@@ -98,6 +100,7 @@ class Plugin extends AppPlugin {
     this._shapeFill = false;    // filled vs outline only
     this._shapeOpacity = 1;     // 0..1
     this._shapeDash = "solid";  // solid | dashed | dotted | dashdot
+    this._textSize = 0.022;     // text-box size as a share of page width
     this._useHeading = true;  // group extracts under a "Highlights" heading (toggleable)
     this._lastNoteLineGuid = null; // last note line clicked — insertion point when the heading is off
     try { const conf = this.getConfiguration(); if (conf && conf.custom) { if (conf.custom.ocrLang) this._ocrLang = conf.custom.ocrLang; if (conf.custom.hlColor) this._hlColor = conf.custom.hlColor; if (conf.custom.useHeading === false) this._useHeading = false; } } catch (e) {}
@@ -113,6 +116,7 @@ class Plugin extends AppPlugin {
       const sf = window.localStorage.getItem("pdfhl_shapeFill"); if (sf === "1") this._shapeFill = true;
       const so = parseFloat(window.localStorage.getItem("pdfhl_shapeOpacity")); if (so > 0 && so <= 1) this._shapeOpacity = so;
       const sd = window.localStorage.getItem("pdfhl_shapeDash"); if (sd) this._shapeDash = sd;
+      const ts = parseFloat(window.localStorage.getItem("pdfhl_textSize")); if (ts > 0) this._textSize = ts;
       const tm = window.localStorage.getItem("pdfhl_textMark"); if (tm) this._textMark = tm;
       const mwv = parseInt(window.localStorage.getItem("pdfhl_markWidth"), 10); if (mwv >= 1 && mwv <= 12) this._markWidth = mwv;
       const nm = window.localStorage.getItem("pdfhl_noteMode"); if (nm) this._noteMode = nm;
@@ -130,6 +134,8 @@ class Plugin extends AppPlugin {
       if (["solid", "dashed", "dotted", "dashdot"].indexOf(this._shapeDash) === -1) this._shapeDash = "solid";
       const st = window.localStorage.getItem("pdfhl_shapeTool"); if (st) this._shapeTool = st;
     } catch (e) {}
+    this._undo = [];            // {label, undo(), redo()} — markup history, capped
+    this._redo = [];
     this._cmds = []; // registered command-palette commands (removed on teardown)
 
     this._hooked = new WeakSet();     // iframes already wired
@@ -157,6 +163,11 @@ class Plugin extends AppPlugin {
         label: "PDF Highlighter: Toggle Highlights heading",
         icon: "ti-heading",
         onSelected: () => this._setUseHeading(!this._useHeading),
+      }));
+      this._cmds.push(this.ui.addCommandPaletteCommand({
+        label: "PDF Highlighter: Export Annotated PDF",
+        icon: "ti-file-download",
+        onSelected: () => this._exportAnnotatedPdf((this._hooks || [])[this._hooks.length - 1]),
       }));
       // Then one command-palette command per OCR language (sets it for scanned-page OCR).
       for (const L of this.OCR_LANGUAGES) {
@@ -327,6 +338,7 @@ class Plugin extends AppPlugin {
           return;
         }
       }
+      if (this._tool === "type") { e.preventDefault(); this._startTextBox(hook, pageEl, e); return; }
       // Area mode: box a region on ANY page. A scanned page still falls through to OCR;
       // a text page reads the text layer instead, so the capture is exact.
       if (this._tool === "text" && this._textMark === "area") { this._startMarquee(hook, pageEl, e, true); return; }
@@ -365,6 +377,12 @@ class Plugin extends AppPlugin {
     // Shift+drag boxes accumulate; releasing Shift OCRs them all as one extract. Esc discards.
     const onKeyUp = (e) => { if (e.key === "Shift") this._commitOcrBoxes(hook); };
     const onKeyDown = (e) => {
+      // Bound to the VIEWER only: in the note, ⌘Z stays Thymer's own undo.
+      if ((e.metaKey || e.ctrlKey) && String(e.key).toLowerCase() === "z") {
+        e.preventDefault(); e.stopPropagation();
+        this._undoStep(hook, e.shiftKey);
+        return;
+      }
       // While the style panel is open it owns Enter (commit) and Esc (revert).
       if (this._stylePanel && (e.key === "Enter" || e.key === "Escape")) {
         e.preventDefault(); e.stopPropagation();
@@ -434,8 +452,10 @@ class Plugin extends AppPlugin {
       try { this._cancelMarquee(hook); } catch (e) {}
       try { this._cancelOcrBoxes(hook); } catch (e) {}
       try { this._cancelShape(hook); } catch (e) {}
+      try { this._closeTextEditor(hook); } catch (e) {}
       try { hook.shapeDrag = null; doc.body.style.cursor = ""; } catch (e) {}
-      try { doc.querySelectorAll(".pdfhl-shapes").forEach((n) => n.remove()); } catch (e) {}
+      try { this._hooks = (this._hooks || []).filter((h) => h !== hook); } catch (e) {}
+      try { doc.querySelectorAll(".pdfhl-shapes, .pdfhl-textedit-layer").forEach((n) => n.remove()); } catch (e) {}
       try { if (hook.rail) { hook.rail.remove(); hook.rail = null; } } catch (e) {}
       try { this._closeStylePanel(); } catch (e) {}
       try { this._closeShortcuts(); } catch (e) {}
@@ -444,6 +464,7 @@ class Plugin extends AppPlugin {
       hook.toolbar = null;
       doc.__pdfhlTeardown = null;
     };
+    this._hooks.push(hook);
     doc.__pdfhlTeardown = teardown;
     this._cleanups.push(teardown);
 
@@ -539,11 +560,11 @@ class Plugin extends AppPlugin {
   // Shared by the text-selection and OCR paths. For OCR, `ocrRects` are the marquee
   // rectangles (normalised, one per box) — encoded in the backlink so the overlay is
   // fully reconstructable from the note alone (a scanned page has no text layer to match).
-  async _commitExtract(hook, note, { paragraphs, page, color, rectsByPage, ocrRects, mode, shape, mark, markWidth }) {
+  async _commitExtract(hook, note, { paragraphs, page, color, rectsByPage, ocrRects, mode, shape, mark, markWidth, forceHid, silent }) {
     mode = mode || "normal";
     mark = mark || "fill";
     const quote = paragraphs.join("\n\n");
-    const hid = "h" + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36);
+    const hid = forceHid || ("h" + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36));
     const fileGuid = this._currentFileGuid(hook);
     const encRects = (rs) => rs.map((r) => [r.x, r.y, r.w, r.h].map((n) => Number(n).toFixed(4)).join(",")).join(";");
     let backlink = "https://" + this.BACKLINK_HOST + "/open?pdf=" + encodeURIComponent(hook.fingerprint) +
@@ -552,6 +573,8 @@ class Plugin extends AppPlugin {
     if (ocrRects && ocrRects.length) backlink += "&ocr=1&rect=" + encRects(ocrRects);
     // A drawn shape carries its geometry and style in the backlink, so the markup is
     // reconstructable from the note alone (same trick as the OCR rectangles).
+    else if (shape && shape.type === "text") backlink += "&shape=text&geom=" + this._encShapeGeom(shape) +
+      "&stroke=" + shape.stroke + "&size=" + Number(shape.size).toFixed(5);
     else if (shape) backlink += "&shape=" + shape.type + "&geom=" + this._encShapeGeom(shape) +
       "&stroke=" + shape.stroke + "&sw=" + Number(shape.sw).toFixed(5) +
       "&fill=" + (shape.fill ? 1 : 0) + "&op=" + Number(shape.op != null ? shape.op : 1).toFixed(2) +
@@ -577,7 +600,16 @@ class Plugin extends AppPlugin {
           dismissible: true, autoDestroyTime: 3200,
         });
       } else if (tgt && tgt.linkLi && tgt.linkUrl) {
-        try {
+        // A merge rewrites a line that already existed, so undo needs a picture of it
+        // BEFORE the change: the old segments, the lines we add, and the folded rects.
+        let prevHid = null;
+        try { prevHid = new URL(tgt.linkUrl).searchParams.get("hid"); } catch (e) {}
+        const beforeSegs = (tgt.linkLi.segments || []).map((sg) => ({ type: sg.type, text: sg.text }));
+        const prev0 = prevHid ? (this._getStore()[hook.fingerprint] || []).find((h) => h.hid === prevHid) : null;
+        const beforeRects = prev0 ? JSON.parse(JSON.stringify(prev0.rectsByPage || {})) : null;
+        const beforeQuote = prev0 ? prev0.quote : null;
+        const added = { lines: [] };
+        const applyMerge = async () => {
           // Strip the link off the old last line — the quote keeps only ONE, at its end.
           const segs = tgt.linkLi.segments || [];
           const kept = segs.filter((sg) => sg.type === "text")
@@ -585,24 +617,38 @@ class Plugin extends AppPlugin {
           if (kept.length) kept[kept.length - 1].text = String(kept[kept.length - 1].text).replace(/\s+$/, "");
           tgt.linkLi.setSegments(kept.length ? kept : [{ type: "text", text: "" }]);
           // Continue the SAME citation: reuse its hid, page and link.
-          await this._writeParagraphs(note, tgt.block, tgt.after, paragraphs, tgt.linkUrl, tgt.linkTitle || ("p." + page));
-        } catch (e) {
+          added.lines = (await this._writeParagraphs(note, tgt.block, tgt.after, paragraphs, tgt.linkUrl, tgt.linkTitle || ("p." + page))) || [];
+          const store = this._getStore();
+          const list = store[hook.fingerprint] || (store[hook.fingerprint] = []);
+          const prev = prevHid ? list.find((h) => h.hid === prevHid) : null;
+          if (prev) {
+            prev.rectsByPage = prev.rectsByPage || {};
+            for (const pg in rectsByPage) prev.rectsByPage[pg] = (prev.rectsByPage[pg] || []).concat(rectsByPage[pg]);
+            prev.quote = (prev.quote ? prev.quote + "\n\n" : "") + quote;
+            this._setStore(store);
+          }
+          this._redrawOverlays(hook);
+        };
+        try { await applyMerge(); }
+        catch (e) {
           this.ui.addToaster({ title: "Couldn't append", message: String(e.message || e), dismissible: true });
           return false;
         }
-        // Fold the new rects into the existing highlight rather than making a new one.
-        let prevHid = null;
-        try { prevHid = new URL(tgt.linkUrl).searchParams.get("hid"); } catch (e) {}
-        const store = this._getStore();
-        const list = store[hook.fingerprint] || (store[hook.fingerprint] = []);
-        const prev = prevHid ? list.find((h) => h.hid === prevHid) : null;
-        if (prev) {
-          prev.rectsByPage = prev.rectsByPage || {};
-          for (const pg in rectsByPage) prev.rectsByPage[pg] = (prev.rectsByPage[pg] || []).concat(rectsByPage[pg]);
-          prev.quote = (prev.quote ? prev.quote + "\n\n" : "") + quote;
-          this._setStore(store);
+        if (!silent) {
+          this._pushUndo({
+            label: "merge",
+            undo: async () => {
+              for (const li of added.lines) { try { li.delete(); } catch (e) {} }
+              added.lines = [];
+              try { tgt.linkLi.setSegments(beforeSegs); } catch (e) {}
+              const st = this._getStore();
+              const p2 = prevHid ? (st[hook.fingerprint] || []).find((h) => h.hid === prevHid) : null;
+              if (p2 && beforeRects) { p2.rectsByPage = beforeRects; p2.quote = beforeQuote; this._setStore(st); }
+              this._redrawOverlays(hook);
+            },
+            redo: applyMerge,
+          });
         }
-        this._redrawOverlays(hook);
         this.ui.addToaster({ title: "Added to quote", message: "One citation, one link.", dismissible: true, autoDestroyTime: 2000 });
         return true;
       }
@@ -615,6 +661,33 @@ class Plugin extends AppPlugin {
     let loc;
     try { loc = await this._insertLocation(note); }
     catch (e) { loc = { parentItem: null, after: null }; }
+
+    // TEXT BOX: what you type on the PDF is what the note shows — a plain H3 heading,
+    // not a quote block, since nothing was quoted.
+    if (mode === "textbox") {
+      let li = null;
+      try {
+        li = await note.createLineItem(loc.parentItem, loc.after, "heading");
+        if (!li) throw new Error("createLineItem returned null");
+        try { li.setHeadingSize(3); } catch (e) {}
+        // Plain heading text, then a linked arrow after it. The linkobj carries no label
+        // of its own; the arrow icon beside it is what you click (the backlink handler
+        // matches an icon whose previous sibling is one of our links).
+        li.setSegments([
+          { type: "text", text: shape.content || "" }, // no trailing space: the icon already carries a 4px margin
+          { type: "linkobj", text: { link: backlink, title: "" } },
+          { type: "icon", text: "ti-arrow-up-right" },
+        ]);
+        if (!loc.parentItem) await this._moveBlockAfter(li, loc.after);
+      } catch (e) {
+        this.ui.addToaster({ title: "Couldn't add text", message: String(e.message || e), dismissible: true });
+        return false;
+      }
+      this._saveHighlight(hook.fingerprint, { hid, page, color: color.key, rectsByPage: {}, quote: "", lineGuid: null, shape });
+      this._redrawShapes(hook);
+      this._noteCreated(hook, hid, "text", { paragraphs: [], page, color, rectsByPage: {}, mode: "textbox", shape, hid, silent });
+      return true;
+    }
 
     // NOTE-LINK (⌥): an empty "note"-styled BLOCK to write your own note in, carrying just
     // the backlink (no extracted text). The overlay box is recovered from the URL rects.
@@ -643,6 +716,7 @@ class Plugin extends AppPlugin {
       this._saveHighlight(hook.fingerprint, { hid, page, color: color.key, rectsByPage, quote: "", lineGuid: blkGuid, shape, mark });
       this._redrawOverlays(hook);
       if (shape) this._redrawShapes(hook);
+      this._noteCreated(hook, hid, shape ? "shape" : "note", { paragraphs: [], page, color, rectsByPage, mode: "link", shape, hid, silent });
       this.ui.addToaster({
         title: shape ? "Shape added" : "Note added",
         message: "p." + page + " → write why it's there", dismissible: true, autoDestroyTime: 2200,
@@ -667,6 +741,7 @@ class Plugin extends AppPlugin {
     const firstGuid = (block && (block.guid || (block._getRow && block._getRow().guid))) || null;
     this._lastBlockGuid = firstGuid; // the block ⌘-append adds into
     this._saveHighlight(hook.fingerprint, { hid, page, color: color.key, rectsByPage, quote, lineGuid: firstGuid, mark, mw: markWidth || this._markWidth });
+    this._noteCreated(hook, hid, "highlight", { paragraphs, page, color, rectsByPage, ocrRects, mode: "normal", mark, markWidth, hid, silent });
     this._redrawOverlays(hook);
     this.ui.addToaster({
       title: "Extracted to note", message: "p." + page + " → " + note.getName(),
@@ -683,6 +758,7 @@ class Plugin extends AppPlugin {
     // A captured list becomes a REAL Thymer list: the marker is consumed by the line type
     // instead of sitting in the text as a stray glyph.
     const BULLET = this.BULLET_RE, NUMBER = this.NUMBER_RE;
+    const made = [];
     let prev = afterLi || null;
     for (let i = 0; i < paragraphs.length; i++) {
       let body = paragraphs[i], type = "text";
@@ -698,8 +774,10 @@ class Plugin extends AppPlugin {
         segs.push({ type: "icon", text: "ti-arrow-up-right" });
       }
       p.setSegments(segs);
+      made.push(p);
       prev = p;
     }
+    return made;
   }
 
   // In record-type notes, createLineItem(null, after) ignores the anchor and prepends the
@@ -762,6 +840,240 @@ class Plugin extends AppPlugin {
   }
 
   // =======================================================================
+  // Export: draw the markup into a copy of the PDF, as real vector objects, so the
+  // text stays selectable and it prints from any reader.
+  //
+  // The pipeline is deliberately in two halves: _collectExportItems() turns the store
+  // into a flat, viewer-independent list (each item already carries the note text it
+  // came from), and _drawExportItem() renders one item. Adding note comments as PDF
+  // text annotations later is a third `kind` in the draw step — no other changes.
+  // =======================================================================
+  _ensurePdfLib() {
+    if (window.PDFLib) return Promise.resolve(window.PDFLib);
+    if (this._pdfLibPromise) return this._pdfLibPromise;
+    this._pdfLibPromise = new Promise((resolve, reject) => {
+      const sc = document.createElement("script");
+      sc.src = this.PDFLIB_CDN;
+      sc.onload = () => (window.PDFLib ? resolve(window.PDFLib) : reject(new Error("pdf-lib did not load")));
+      sc.onerror = () => reject(new Error("Couldn't reach the PDF library (needs internet the first time)."));
+      document.head.appendChild(sc);
+    });
+    return this._pdfLibPromise;
+  }
+
+  // hid -> the text written under it in the note. Not drawn yet; it is what a future
+  // "include comments" pass will attach as PDF text annotations.
+  async _noteTextByHid(hook) {
+    const out = {};
+    try {
+      const note = this._findAssociatedNote(hook.iframe);
+      if (!note) return out;
+      const items = (await note.getLineItems()) || [];
+      const kids = {};
+      for (const li of items) {
+        const it = li._getItem && li._getItem();
+        if (it && it.pguid) (kids[it.pguid] = kids[it.pguid] || []).push({ li, oind: it.oind || 0 });
+      }
+      const textOf = (li) => (li.segments || []).filter((x) => x.type === "text")
+        .map((x) => (typeof x.text === "string" ? x.text : "")).join("").trim();
+      for (const pg in kids) {
+        const run = [];
+        for (const k of kids[pg].sort((a, b) => (a.oind || 0) - (b.oind || 0))) {
+          const t = textOf(k.li);
+          if (t) run.push(t);
+          const link = (k.li.segments || []).find((x) => x && x.type === "linkobj" && x.text &&
+            typeof x.text.link === "string" && x.text.link.indexOf(this.BACKLINK_HOST) !== -1);
+          if (!link) continue;
+          try {
+            const hid = new URL(link.text.link).searchParams.get("hid");
+            if (hid) out[hid] = run.join("\n\n");
+          } catch (e) {}
+          run.length = 0;
+        }
+      }
+    } catch (e) {}
+    return out;
+  }
+
+  async _collectExportItems(hook) {
+    const notes = await this._noteTextByHid(hook);
+    const items = [], missing = [];
+    for (const h of this._getStore()[hook.fingerprint] || []) {
+      const note = notes[h.hid] || "";
+      if (h.shape) { items.push({ kind: "shape", page: h.page, shape: h.shape, note: note }); continue; }
+      const byPage = h.rectsByPage || {};
+      const pages = Object.keys(byPage);
+      if (!pages.length) { missing.push(h); continue; } // never located (page not opened this session)
+      for (const pnum of pages) {
+        items.push({
+          kind: "mark", page: parseInt(pnum, 10), rects: byPage[pnum],
+          color: h.color, mark: h.mark || "fill", mw: h.mw || 6, note: note,
+        });
+      }
+    }
+    return { items: items, missing: missing.length };
+  }
+
+  // Map normalised viewer coordinates onto PDF points for one page, honouring /Rotate.
+  _pdfPageGeom(PDFLib, page) {
+    const size = page.getSize(), W = size.width, H = size.height;
+    const rot = ((page.getRotation().angle % 360) + 360) % 360;
+    const turned = rot === 90 || rot === 270;
+    const DW = turned ? H : W, DH = turned ? W : H;
+    const pt = (nx, ny) => {
+      const dx = nx * DW, dy = ny * DH;
+      if (rot === 90) return { x: dy, y: dx };
+      if (rot === 180) return { x: W - dx, y: dy };
+      if (rot === 270) return { x: W - dy, y: H - dx };
+      return { x: dx, y: H - dy };
+    };
+    const rect = (nx, ny, nw, nh) => {
+      const a = pt(nx, ny), b = pt(nx + nw, ny + nh);
+      return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), width: Math.abs(b.x - a.x), height: Math.abs(b.y - a.y) };
+    };
+    return { W: W, H: H, DW: DW, DH: DH, pt: pt, rect: rect };
+  }
+
+  _drawExportItem(PDFLib, page, g, item) {
+    const toColor = (csv) => {
+      const a = String(csv).split(",").map(Number);
+      return PDFLib.rgb((a[0] || 0) / 255, (a[1] || 0) / 255, (a[2] || 0) / 255);
+    };
+    if (item.kind === "mark") {
+      const col = toColor((this.COLORS.find((c) => c.key === item.color) || this.COLORS[0]).rgb);
+      for (const r of item.rects) {
+        if (item.mark === "fill") {
+          page.drawRectangle(Object.assign(g.rect(r.x, r.y, r.w, r.h), { color: col, opacity: 0.4 }));
+        } else {
+          const th = Math.max(0.002, r.h * (item.mw * 2.4) / 100);
+          const y = item.mark === "underline" ? r.y + r.h - th : r.y + r.h / 2 - th / 2;
+          page.drawRectangle(Object.assign(g.rect(r.x, y, r.w, th), { color: col, opacity: 0.95 }));
+        }
+      }
+      return;
+    }
+    if (item.kind !== "shape") return;
+    if (item.shape && item.shape.type === "text") {
+      const g2 = item.shape.geom || [];
+      if (g2.length < 2) return;
+      const size = Math.max(2, (item.shape.size || 0.022) * g.DW);
+      const at = g.pt(g2[0], g2[1] + (g2[3] || 0));   // baseline sits at the box's bottom
+      page.drawText(String(item.shape.content || ""), {
+        x: at.x, y: at.y + size * 0.22, size: size,
+        font: item.font, color: toColor(this._shapeRgb(item.shape.stroke)),
+      });
+      return;
+    }
+    const sp = item.shape, gm = sp.geom || [];
+    const col = toColor(this._shapeRgb(sp.stroke));
+    const sw = Math.max(0.4, (sp.sw || 0.003) * g.DW);
+    const op = sp.op != null ? sp.op : 1;
+    const dashStr = this._dashArray(sp.dash, sw);
+    const dash = dashStr ? dashStr.split(",").map(Number) : undefined;
+    // A dot is a zero-length dash: it only shows with a ROUND cap. On screen the SVG sets
+    // stroke-linecap; in the PDF the default butt cap turned every dot into a thin tick.
+    const roundCap = (PDFLib.LineCapStyle && PDFLib.LineCapStyle.Round) || 1;
+    const dotted = sp.dash === "dotted" || sp.dash === "dashdot";
+    const stroke = { borderColor: col, borderWidth: sw, borderOpacity: op, borderDashArray: dash };
+    if (dotted) stroke.borderLineCap = roundCap;
+    const fill = sp.fill ? { color: col, opacity: 0.25 * op } : {};
+    if (sp.type === "rect") {
+      page.drawRectangle(Object.assign(g.rect(gm[0], gm[1], gm[2], gm[3]), stroke, fill));
+    } else if (sp.type === "ellipse") {
+      const r = g.rect(gm[0], gm[1], gm[2], gm[3]);
+      page.drawEllipse(Object.assign({
+        x: r.x + r.width / 2, y: r.y + r.height / 2, xScale: r.width / 2, yScale: r.height / 2,
+      }, stroke, fill));
+    } else if (sp.type === "line" || sp.type === "arrow") {
+      const line = { thickness: sw, color: col, opacity: op, dashArray: dash, lineCap: roundCap };
+      page.drawLine(Object.assign({ start: g.pt(gm[0], gm[1]), end: g.pt(gm[2], gm[3]) }, line));
+      if (sp.type === "arrow") {
+        // Two strokes rather than a filled triangle: correct under every page rotation.
+        const vx = (gm[2] - gm[0]) * g.DW, vy = (gm[3] - gm[1]) * g.DH;
+        const len = Math.sqrt(vx * vx + vy * vy);
+        if (len > 0.001) {
+          const ux = vx / len, uy = vy / len, hl = Math.max(5, sw * 3);
+          for (const ang of [0.45, -0.45]) {
+            const c = Math.cos(ang), s2 = Math.sin(ang);
+            const bx = -(ux * c - uy * s2) * hl, by = -(ux * s2 + uy * c) * hl;
+            page.drawLine(Object.assign({
+              start: g.pt(gm[2], gm[3]),
+              end: g.pt(gm[2] + bx / g.DW, gm[3] + by / g.DH),
+            }, line, { dashArray: undefined }));
+          }
+        }
+      }
+    } else if (sp.type === "draw") {
+      for (let i = 0; i + 3 < gm.length; i += 2) {
+        page.drawLine({
+          start: g.pt(gm[i], gm[i + 1]), end: g.pt(gm[i + 2], gm[i + 3]),
+          thickness: sw, color: col, opacity: op, dashArray: dash, lineCap: roundCap,
+        });
+      }
+    }
+  }
+
+  async _exportAnnotatedPdf(hook) {
+    if (!hook || !hook.app) {
+      this.ui.addToaster({ title: "No PDF open", message: "Open a PDF, then export.", dismissible: true });
+      return;
+    }
+    const prog = this.ui.addToaster({ title: "Exporting…", message: "Drawing your markup into a copy of the PDF.", dismissible: false });
+    try {
+      const PDFLib = await this._ensurePdfLib();
+      if (!hook.app.pdfDocument || typeof hook.app.pdfDocument.getData !== "function") {
+        throw new Error("This viewer doesn't expose the PDF bytes.");
+      }
+      const raw = await hook.app.pdfDocument.getData();
+      // getData() builds its array inside the VIEWER IFRAME. pdf-lib runs in Thymer's
+      // window, where an instanceof check against that foreign Uint8Array fails, so copy
+      // the bytes into this realm first.
+      const bytes = new Uint8Array(raw && raw.length != null ? raw.length : 0);
+      bytes.set(raw);
+      const doc = await PDFLib.PDFDocument.load(bytes, { ignoreEncryption: true });
+      const pages = doc.getPages();
+      const collected = await this._collectExportItems(hook);
+      let font = null;
+      if (collected.items.some((i) => i.shape && i.shape.type === "text")) {
+        font = await doc.embedFont(PDFLib.StandardFonts.Helvetica);
+      }
+      let drawn = 0;
+      for (const item of collected.items) {
+        const page = pages[(item.page || 1) - 1];
+        if (!page) continue;
+        try {
+          item.font = font;
+          this._drawExportItem(PDFLib, page, this._pdfPageGeom(PDFLib, page), item);
+          drawn++;
+        } catch (e) {}
+      }
+      const out = await doc.save();
+      const base = String((hook.app._title || hook.doc.title || "document")).replace(/\.pdf$/i, "") || "document";
+      this._downloadBlob(new Blob([out], { type: "application/pdf" }), base + " (annotated).pdf");
+      try { prog && prog.destroy(); } catch (e) {}
+      this.ui.addToaster({
+        title: "Exported " + drawn + " mark" + (drawn === 1 ? "" : "s"),
+        message: collected.missing
+          ? collected.missing + " on pages you haven't opened were skipped — scroll through them and export again."
+          : "Saved beside your downloads as a new PDF.",
+        dismissible: true, autoDestroyTime: collected.missing ? 6000 : 3200,
+      });
+    } catch (e) {
+      try { prog && prog.destroy(); } catch (er) {}
+      this.ui.addToaster({ title: "Export failed", message: String((e && e.message) || e), dismissible: true });
+    }
+  }
+
+  _downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { try { a.remove(); URL.revokeObjectURL(url); } catch (e) {} }, 5000);
+  }
+
+  // =======================================================================
   // Shape markup: draw annotations over the page. Each shape is written to the note
   // as a "note" block — an empty line to write WHY it's there, plus a backlink whose
   // URL carries the geometry — so shapes persist, sync and delete like highlights.
@@ -815,6 +1127,10 @@ class Plugin extends AppPlugin {
         { items: this.TEXT_MARKS, current: this._textMark },
         { items: this.NOTE_MODES, current: this._noteMode },
       ], (k) => this._setTextChoice(hook, k)));
+    // Text boxes: typed straight onto the PDF, deliberately NOT written to the note.
+    const typeBtn = mkBtn("pdfhl-type-btn", () => { this._closeFlyout(); this._setTool(hook, "type"); });
+    typeBtn.title = "Text Box";
+    typeBtn.innerHTML = '<svg viewBox="0 0 20 20" width="18" height="18"><path d="M4.4 6.2 V4.6 H15.6 V6.2 M10 4.6 V15.4 M7.8 15.4 H12.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
     const shapeBtn = mkBtn("pdfhl-shape-btn", null);
     wireSplit(shapeBtn,
       () => this._setShapeTool(hook, this._shapeTool),
@@ -833,6 +1149,11 @@ class Plugin extends AppPlugin {
     style.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); });
     style.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); this._toggleStylePanel(hook, style); });
     rail.appendChild(style);
+    // Export lives here rather than only in the command palette: with focus in the PDF,
+    // ⌘P is the viewer's own print, so the palette can't be reached from where you work.
+    const exp = mkBtn("pdfhl-export-btn", () => { this._closeFlyout(); this._closeStylePanel(); this._exportAnnotatedPdf(hook); });
+    exp.title = "Export Annotated PDF";
+    exp.innerHTML = '<svg viewBox="0 0 20 20" width="18" height="18"><path d="M10 3.4 V12.4 M6.4 9.2 L10 12.8 L13.6 9.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 14.4 V15.4 A1.2 1.2 0 0 0 5.2 16.6 H14.8 A1.2 1.2 0 0 0 16 15.4 V14.4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
     const help = mkBtn("pdfhl-help-btn", (b2) => this._toggleShortcuts(hook, b2));
     help.title = "Shortcuts";
     help.innerHTML = '<svg viewBox="0 0 20 20" width="18" height="18"><circle cx="10" cy="10" r="7.2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7.9 8.1 A2.2 2.2 0 1 1 10.3 10.6 V11.9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="10.3" cy="14.3" r="0.9" fill="currentColor"/></svg>';
@@ -878,7 +1199,7 @@ class Plugin extends AppPlugin {
     };
     // The panel edits whatever you are actually working on: a selected shape, the armed
     // shape tool, or — with the Text tool — the colour new highlights get.
-    const shapeCtx = !!(hook && hook.selectedShape) || this._isShapeTool();
+    const shapeCtx = !!(hook && hook.selectedShape) || this._usesShapeStyle();
     if (!this._styleSnapshot) { // Esc restores this
       const selHid = (hook && hook.selectedShape) || null;
       const selEntry = selHid ? (this._getStore()[hook.fingerprint] || []).find((h) => h.hid === selHid && h.shape) : null;
@@ -944,7 +1265,21 @@ class Plugin extends AppPlugin {
       wrap.appendChild(inp);
       return wrap;
     };
-    if (shapeCtx) { // stroke weight, fill and opacity mean nothing for a text highlight
+    const selShape = (hook && hook.selectedShape)
+      ? ((this._getStore()[hook.fingerprint] || []).find((h) => h.hid === hook.selectedShape) || {}).shape
+      : null;
+    const textCtx = shapeCtx && ((selShape && selShape.type === "text") || (!selShape && this._tool === "type"));
+    if (textCtx) { // a text box has a size, not a stroke, a fill or a dash pattern
+      p.appendChild(slider("Size", 10, 120, 1, Math.round((selShape ? selShape.size : this._textSize) * 1000), {
+        format: (v) => String(v),
+        apply: (v) => {
+          const n = Number(v) / 1000;
+          this._textSize = n;
+          try { window.localStorage.setItem("pdfhl_textSize", String(n)); } catch (e) {}
+          if (hook && hook.selectedShape) this._restyleShape(hook, hook.selectedShape, { size: n });
+        },
+      }));
+    } else if (shapeCtx) { // stroke weight, fill and opacity mean nothing for a text highlight
     p.appendChild(rule());
     // --- fill: a proper switch, not a system checkbox (which looks alien in Thymer) ---
     const fillRow = doc.createElement("div");
@@ -1118,7 +1453,7 @@ class Plugin extends AppPlugin {
   }
 
   _paintStyleDot() {
-    const rgb = this._isShapeTool()
+    const rgb = this._usesShapeStyle()
       ? this._shapeRgb(this._shapeColor)
       : ((this.COLORS.find((c) => c.key === this._hlColor) || this.COLORS[0]).rgb);
     document.querySelectorAll(".pdfhl-style-dot").forEach((d) => { d.style.background = "rgb(" + rgb + ")"; });
@@ -1127,10 +1462,29 @@ class Plugin extends AppPlugin {
 
   // Restyle an existing shape: update the store, redraw, and rewrite the style params in
   // the note's backlink so the change survives (the note is the durable source).
-  async _restyleShape(hook, hid, patch) {
+  async _restyleShape(hook, hid, patch, silent) {
     const store = this._getStore();
     const entry = (store[hook.fingerprint] || []).find((h) => h.hid === hid && h.shape);
     if (!entry) return;
+    if (!silent && !patch.geom) { // geometry pushes its own entry in _finishShapeDrag
+      const before = {};
+      for (const k in patch) before[k] = entry.shape[k];
+      const after = Object.assign({}, patch);
+      this._pushUndo({
+        label: "style", coalesce: "style:" + hid,
+        undo: () => this._restyleShape(hook, hid, before, true),
+        redo: () => this._restyleShape(hook, hid, after, true),
+      });
+    }
+    // Resizing text must carry its box with it, or the hit area stops matching what you see.
+    if (patch.size != null && entry.shape.type === "text") {
+      const from = entry.shape.size || 0.022, to = patch.size;
+      const g = entry.shape.geom || [];
+      if (from > 0 && g.length >= 4) {
+        const k = to / from;
+        patch.geom = [g[0], g[1], g[2] * k, g[3] * k];
+      }
+    }
     Object.assign(entry.shape, patch);
     this._setStore(store);
     this._redrawShapes(hook);
@@ -1153,6 +1507,7 @@ class Plugin extends AppPlugin {
           if (patch.geom != null) set("geom", this._encShapeGeom({ geom: patch.geom }));
           if (patch.stroke != null) set("stroke", patch.stroke);
           if (patch.sw != null) set("sw", Number(patch.sw).toFixed(5));
+          if (patch.size != null) set("size", Number(patch.size).toFixed(5));
           if (patch.dash != null) set("ls", patch.dash);
           if (patch.fill != null) set("fill", patch.fill ? 1 : 0);
           if (patch.op != null) set("op", Number(patch.op).toFixed(2));
@@ -1216,9 +1571,18 @@ class Plugin extends AppPlugin {
         ["Area + drag", "Box a region and capture its text"],
         ["Shift + boxes", "Scanned pages: OCR several boxes as one"],
       ]],
+      ["Text box", [
+        ["Click", "Place a box and type on the page"],
+        ["Enter", "Keep it (Shift+Enter for a new line)"],
+        ["Esc", "Discard it"],
+      ]],
       ["Shapes", [
         ["Drag", "Draw the selected shape"],
         ["Esc", "Cancel the shape being drawn"],
+      ]],
+      ["History", [
+        ["⌘Z", "Undo the last mark"],
+        ["⌘⇧Z", "Redo it"],
       ]],
       ["Select", [
         ["Click", "Select a shape"],
@@ -1232,6 +1596,7 @@ class Plugin extends AppPlugin {
         ["Esc", "Undo them"],
       ]],
       ["Tool rail", [
+        ["Export", "Save a copy of the PDF with your markup"],
         ["Click", "Use the tool shown"],
         ["Bottom edge", "Open its menu"],
         ["Right-click", "Open its menu"],
@@ -1442,6 +1807,8 @@ class Plugin extends AppPlugin {
     document.querySelectorAll(".pdfhl-tools").forEach((rail) => {
       const selb = rail.querySelector(".pdfhl-select-btn");
       if (selb) this._styleToolButton(selb, this._tool === "select");
+      const yb = rail.querySelector(".pdfhl-type-btn");
+      if (yb) this._styleToolButton(yb, this._tool === "type");
       const tb = rail.querySelector(".pdfhl-text-btn");
       if (tb) {
         this._styleToolButton(tb, this._tool === "text");
@@ -1466,7 +1833,11 @@ class Plugin extends AppPlugin {
   }
 
   // "select" and "text" are selection modes; anything else draws.
-  _isShapeTool() { return this._tool !== "select" && this._tool !== "text"; }
+  _isShapeTool() { return this._tool !== "select" && this._tool !== "text" && this._tool !== "type"; }
+
+  // Text boxes are drawn markup, so they take the SHAPE palette — the same one the style
+  // panel and the rail's colour dot must show while the Text Box tool is armed.
+  _usesShapeStyle() { return this._isShapeTool() || this._tool === "type"; }
 
   _setTool(hook, key) {
     this._tool = key;
@@ -1546,7 +1917,9 @@ class Plugin extends AppPlugin {
   _shapeBBox(shape) {
     const g = (shape && shape.geom) || [];
     if (g.length < 4) return null;
-    if (shape.type === "rect" || shape.type === "ellipse") return { x: g[0], y: g[1], w: g[2], h: g[3] };
+    if (shape.type === "rect" || shape.type === "ellipse" || shape.type === "text") {
+      return { x: g[0], y: g[1], w: g[2] || 0.02, h: g[3] || 0.02 };
+    }
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     for (let i = 0; i + 1 < g.length; i += 2) {
       x0 = Math.min(x0, g[i]); x1 = Math.max(x1, g[i]);
@@ -1627,6 +2000,21 @@ class Plugin extends AppPlugin {
         head.setAttribute("fill", "rgb(" + rgb + ")");
         head.setAttribute("stroke", "none");
       }
+    } else if (shape.type === "text") {
+      const g2 = shape.geom || [];
+      if (g2.length < 2) return null;
+      const fontPx = Math.max(4, (shape.size || 0.022) * W);
+      el = doc.createElementNS(NS, "text");
+      el.setAttribute("x", g2[0] * W);
+      el.setAttribute("y", g2[1] * H + fontPx);        // SVG text sits on its baseline
+      el.setAttribute("font-size", fontPx);
+      el.setAttribute("font-family", "system-ui,-apple-system,sans-serif");
+      el.setAttribute("fill", "rgb(" + rgb + ")");
+      el.setAttribute("stroke", "none");
+      el.textContent = shape.content || "";
+      el.setAttribute("opacity", shape.op != null ? shape.op : 1);
+      if (hid) el.setAttribute("data-hid", hid);
+      return el;
     } else if (shape.type === "draw") {
       if (g.length < 4) return null;
       const pts = [];
@@ -1671,11 +2059,23 @@ class Plugin extends AppPlugin {
       const ref = pageEl.querySelector(".textLayer") || pageEl.querySelector("canvas");
       if (!ref) continue;
       const b = ref.getBoundingClientRect();
-      const bb = this._shapeBBox(h.shape);
-      if (!bb) continue;
       const pad = 6;
-      const x0 = b.left + bb.x * b.width, y0 = b.top + bb.y * b.height;
-      const w = bb.w * b.width, hh = bb.h * b.height;
+      // Prefer the RENDERED element's own box: for text especially, the stored width came
+      // from the editor's typography, which need not match the SVG's to the pixel. Hit what
+      // is actually drawn, and fall back to the stored geometry if it isn't on screen.
+      let x0, y0, w, hh;
+      const drawnEl = doc.querySelector('.pdfhl-shapes [data-hid="' +
+        (window.CSS && CSS.escape ? CSS.escape(h.hid) : h.hid) + '"]');
+      if (drawnEl) {
+        const r = drawnEl.getBoundingClientRect();
+        if (r.width || r.height) { x0 = r.left; y0 = r.top; w = r.width; hh = r.height; }
+      }
+      if (x0 == null) {
+        const bb = this._shapeBBox(h.shape);
+        if (!bb) continue;
+        x0 = b.left + bb.x * b.width; y0 = b.top + bb.y * b.height;
+        w = bb.w * b.width; hh = bb.h * b.height;
+      }
       if (x >= x0 - pad && x <= x0 + w + pad && y >= y0 - pad && y <= y0 + hh + pad) return h.hid;
     }
     return null;
@@ -1705,10 +2105,134 @@ class Plugin extends AppPlugin {
     return el;
   }
 
+  _noteCreated(hook, hid, label, inputs) {
+    if (inputs && inputs.silent) return;
+    const remake = this._remakeFn(hook, inputs);
+    this._pushUndo({
+      label: label,
+      undo: () => this._deleteHighlight(hook, hid, true),
+      redo: remake,
+    });
+  }
+
+  // ---- undo / redo ---------------------------------------------------------
+  // Every mark is a discrete operation against the note, so each one can state its own
+  // inverse. Style changes coalesce, so dragging a slider is one step, not forty.
+  _pushUndo(entry) {
+    const last = this._undo[this._undo.length - 1];
+    if (entry.coalesce && last && last.coalesce === entry.coalesce && Date.now() - last.at < 900) {
+      last.redo = entry.redo; last.at = Date.now();
+      this._redo = [];
+      return;
+    }
+    entry.at = Date.now();
+    this._undo.push(entry);
+    if (this._undo.length > 60) this._undo.shift();
+    this._redo = [];
+  }
+
+  // Recreating a mark reuses its id, so its backlink and overlay come back unchanged.
+  _remakeFn(hook, inputs) {
+    return async () => {
+      const note = this._findAssociatedNote(hook.iframe);
+      if (!note) return;
+      await this._commitExtract(hook, note, Object.assign({}, inputs, { forceHid: inputs.hid, silent: true }));
+    };
+  }
+
+  async _undoStep(hook, redo) {
+    const from = redo ? this._redo : this._undo;
+    const to = redo ? this._undo : this._redo;
+    const step = from.pop();
+    if (!step) {
+      this.ui.addToaster({ title: redo ? "Nothing to redo" : "Nothing to undo", dismissible: true, autoDestroyTime: 1400 });
+      return;
+    }
+    try { await (redo ? step.redo() : step.undo()); } catch (e) {}
+    to.push(step);
+    await this._rebuildFromNote(hook);
+    this._redrawShapes(hook);
+    this.ui.addToaster({
+      title: (redo ? "Redid " : "Undid ") + (step.label || "change"),
+      dismissible: true, autoDestroyTime: 1400,
+    });
+  }
+
+  // ---- text boxes ----------------------------------------------------------
+  // Type straight onto the page. The typed text becomes an H3 line in the note, so it is
+  // still recoverable from there like every other mark.
+  _startTextBox(hook, pageEl, e) {
+    this._closeTextEditor(hook);
+    const ref = pageEl.querySelector(".textLayer") || pageEl.querySelector("canvas");
+    if (!ref) return;
+    const box = ref.getBoundingClientRect();
+    if (!box.width || !box.height) return;
+    const page = parseInt(pageEl.getAttribute("data-page-number"), 10) || this._currentPage(hook);
+    const nx = (e.clientX - box.left) / box.width, ny = (e.clientY - box.top) / box.height;
+    const fontPx = Math.max(8, this._textSize * box.width);
+    const ed = hook.doc.createElement("div");
+    ed.className = "pdfhl-text-editor";
+    ed.setAttribute("contenteditable", "true");
+    ed.style.cssText = "position:absolute;left:" + (nx * 100) + "%;top:" + (ny * 100) + "%;" +
+      "min-width:20px;z-index:6;outline:none;white-space:pre;line-height:1.25;" +
+      "font:" + fontPx + "px/1.25 system-ui,-apple-system,sans-serif;" +
+      "color:rgb(" + this._shapeRgb(this._shapeColor) + ");" +
+      "box-shadow:0 0 0 1px " + this._accentRgba(0.9) + ";padding:0 2px;background:rgba(255,255,255,.7);";
+    let layer = pageEl.querySelector(".pdfhl-textedit-layer");
+    if (!layer) {
+      layer = hook.doc.createElement("div");
+      layer.className = "pdfhl-textedit-layer";
+      layer.style.cssText = "position:absolute;left:" + ref.offsetLeft + "px;top:" + ref.offsetTop +
+        "px;width:" + ref.offsetWidth + "px;height:" + ref.offsetHeight + "px;z-index:6;";
+      pageEl.appendChild(layer);
+    }
+    layer.appendChild(ed);
+    hook.textEdit = { ed, layer, page, nx, ny, box };
+    setTimeout(() => { try { ed.focus(); } catch (er) {} }, 0);
+    const done = (commit) => { if (commit) this._commitTextBox(hook); else this._closeTextEditor(hook); };
+    ed.addEventListener("keydown", (ev) => {
+      ev.stopPropagation();
+      if (ev.key === "Escape") { ev.preventDefault(); done(false); }
+      else if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); done(true); }
+    });
+    ed.addEventListener("blur", () => setTimeout(() => done(true), 0));
+  }
+
+  async _commitTextBox(hook) {
+    const t = hook.textEdit;
+    if (!t) return;
+    const content = String(t.ed.textContent || "").replace(/\s+/g, " ").trim();
+    const w = t.ed.offsetWidth, h = t.ed.offsetHeight;
+    this._closeTextEditor(hook);
+    if (!content) return;
+    const note = this._findAssociatedNote(hook.iframe);
+    if (!note) {
+      this.ui.addToaster({ title: "No note found", message: "Open the PDF beside its note, then type.", dismissible: true });
+      return;
+    }
+    const shape = {
+      type: "text",
+      geom: [t.nx, t.ny, w / t.box.width, h / t.box.height],
+      stroke: this._shapeColor, size: this._textSize, content: content,
+    };
+    await this._commitExtract(hook, note, {
+      paragraphs: [], page: t.page, color: this._currentColor(), rectsByPage: {}, mode: "textbox", shape: shape,
+    });
+  }
+
+  _closeTextEditor(hook) {
+    const t = hook && hook.textEdit;
+    if (!t) return;
+    try { t.ed.remove(); } catch (e) {}
+    try { if (t.layer && !t.layer.children.length) t.layer.remove(); } catch (e) {}
+    hook.textEdit = null;
+  }
+
   // ---- move & resize -------------------------------------------------------
   // Handle positions in normalised page coords. A box gets eight, a line or arrow gets
   // its two ends, a freehand stroke gets its bounding corners (it scales as a whole).
   _shapeHandles(shape) {
+    if (shape.type === "text") return []; // move it, don't stretch it
     const g = shape.geom || [];
     if (shape.type === "line" || shape.type === "arrow") {
       if (g.length < 4) return [];
@@ -1797,7 +2321,9 @@ class Plugin extends AppPlugin {
 
   _geomMoved(shape, g0, dx, dy) {
     const cl = (v) => Math.max(0, Math.min(1, v));
-    if (shape.type === "rect" || shape.type === "ellipse") {
+    // Box-shaped geometry moves by its ORIGIN only; the width and height stay put. (A text
+    // box lives here too — shifting its w/h would stretch the hit area as you dragged.)
+    if (shape.type === "rect" || shape.type === "ellipse" || shape.type === "text") {
       return [cl(g0[0] + dx), cl(g0[1] + dy), g0[2], g0[3]];
     }
     const out = g0.slice();
@@ -1843,6 +2369,12 @@ class Plugin extends AppPlugin {
     const geom = (d.entry.shape.geom || []).slice();
     const moved = geom.some((v, i) => Math.abs(v - (d.geom0[i] || 0)) > 0.0005);
     if (!moved) return;
+    const before = d.geom0.slice(), hid = d.hid;
+    this._pushUndo({
+      label: d.kind === "move" ? "move" : "resize",
+      undo: () => this._restyleShape(hook, hid, { geom: before }),
+      redo: () => this._restyleShape(hook, hid, { geom: geom }),
+    });
     this._restyleShape(hook, d.hid, { geom });
   }
 
@@ -2689,10 +3221,19 @@ class Plugin extends AppPlugin {
     if (!d) return;
     let n = 0;
     const tick = () => {
-      const boxes = [...d.querySelectorAll('.pdfhl-box[data-hid="' + (window.CSS && CSS.escape ? CSS.escape(hid) : hid) + '"]')];
+      // Highlights are .pdfhl-box divs; shapes and text boxes are SVG nodes in the shapes
+      // layer. Both carry data-hid, and both have to be reachable from a backlink.
+      const esc = window.CSS && CSS.escape ? CSS.escape(hid) : hid;
+      const boxes = [...d.querySelectorAll('.pdfhl-box[data-hid="' + esc + '"], .pdfhl-shapes [data-hid="' + esc + '"]')];
       if (boxes.length) {
-        boxes[0].scrollIntoView({ block: "center", behavior: "smooth" });
-        boxes.forEach((b) => { b.classList.remove("pdfhl-pulse"); void b.offsetWidth; b.classList.add("pdfhl-pulse"); });
+        try { boxes[0].scrollIntoView({ block: "center", behavior: "smooth" }); } catch (er) {
+          const pg = boxes[0].closest && boxes[0].closest(".page");
+          if (pg) pg.scrollIntoView({ block: "center" });
+        }
+        boxes.forEach((b) => {
+          if (!b.classList) return;
+          b.classList.remove("pdfhl-pulse"); void b.getBoundingClientRect(); b.classList.add("pdfhl-pulse");
+        });
         return;
       }
       if (++n <= 40) setTimeout(tick, 100);
@@ -2742,7 +3283,27 @@ class Plugin extends AppPlugin {
     } catch (e) {}
   }
 
-  async _deleteHighlight(hook, hid) {
+  async _deleteHighlight(hook, hid, silent) {
+    if (!silent) { // capture what it takes to recreate this exact mark
+      try {
+        const e0 = (this._getStore()[hook.fingerprint] || []).find((h) => h.hid === hid);
+        const note0 = this._findAssociatedNote(hook.iframe);
+        const lines = note0 ? await this._findHighlightLines(note0, hid) : [];
+        const paras = lines
+          .map((li) => (li.segments || []).filter((sg) => sg.type === "text")
+            .map((sg) => (typeof sg.text === "string" ? sg.text : "")).join("").trim())
+          .filter(Boolean);
+        if (e0) {
+          const inputs = {
+            paragraphs: paras, page: e0.page, color: this.COLORS.find((c) => c.key === e0.color) || this._currentColor(),
+            rectsByPage: e0.rectsByPage || {}, shape: e0.shape, mark: e0.mark, markWidth: e0.mw, hid: hid,
+            mode: e0.shape ? (e0.shape.type === "text" ? "textbox" : "link") : (paras.length ? "normal" : "link"),
+          };
+          const remake = this._remakeFn(hook, inputs);
+          this._pushUndo({ label: "delete", undo: remake, redo: () => this._deleteHighlight(hook, hid, true) });
+        }
+      } catch (e) {}
+    }
     const store = this._getStore();
     if (store[hook.fingerprint]) {
       store[hook.fingerprint] = store[hook.fingerprint].filter((h) => h.hid !== hid);
@@ -2762,7 +3323,7 @@ class Plugin extends AppPlugin {
         for (const li of lines) { try { li.delete(); } catch (e) {} }
       }
     } catch (e) {}
-    this.ui.addToaster({ title: wasShape ? "Shape deleted" : "Highlight deleted", dismissible: true, autoDestroyTime: 1500 });
+    if (!silent) this.ui.addToaster({ title: wasShape ? "Shape deleted" : "Highlight deleted", dismissible: true, autoDestroyTime: 1500 });
   }
 
   // Lines to delete for one highlight, via the `hid` carried in the backlink URL (line
@@ -2796,7 +3357,10 @@ class Plugin extends AppPlugin {
     if (cur.length) runs.push(cur);
     const target = runs.find((run) => run.indexOf(anchor) !== -1) || [anchor];
     const highlightRuns = runs.filter((run) => run.some(hasAnyBacklink));
-    if (highlightRuns.length <= 1) return target.concat([block]); // last one → take the block too
+    // Only a wrapper BLOCK goes with the last highlight. The parent may instead be the
+    // "Highlights" heading (a text box is a heading line under it), which must survive.
+    const parentType = ((block._getItem && block._getItem()) || {}).type;
+    if (highlightRuns.length <= 1 && parentType === "block") return target.concat([block]);
     return target; // other highlights remain → keep the block
   }
 
@@ -2891,7 +3455,14 @@ class Plugin extends AppPlugin {
         if (shapeType) {
           const geom = this._decShapeGeom(u.searchParams.get("geom"));
           const op = parseFloat(u.searchParams.get("op"));
-          if (geom) shape = {
+          if (geom && shapeType === "text") {
+            shape = {
+              type: "text", geom: geom,
+              stroke: u.searchParams.get("stroke") || "red",
+              size: parseFloat(u.searchParams.get("size")) || 0.022,
+              content: String(paragraphs.join(" ") || (link.text && link.text.title) || "").trim(),
+            };
+          } else if (geom) shape = {
             type: shapeType, geom,
             stroke: u.searchParams.get("stroke") || "red",
             sw: parseFloat(u.searchParams.get("sw")) || 0.003,
@@ -3091,6 +3662,8 @@ class Plugin extends AppPlugin {
       ".pdfhl-box{position:absolute;border-radius:2px;}", // blending is on .pdfhl-overlay
       ".pdfhl-box.pdfhl-pulse{animation:pdfhl-pulse .9s ease-out 2;}",
       "@keyframes pdfhl-pulse{0%{outline:0 solid rgba(0,0,0,0);}40%{outline:3px solid rgba(0,0,0,.55);}100%{outline:0 solid rgba(0,0,0,0);}}",
+      ".pdfhl-shapes .pdfhl-pulse{animation:pdfhl-flash .9s ease-out 2;}",
+      "@keyframes pdfhl-flash{0%,100%{opacity:1;}45%{opacity:.25;}}",
       ".pdfhl-marquee{position:fixed;z-index:2147483646;border:1.5px dashed rgba(31,31,31,.9);",
       "background:rgba(31,31,31,.10);pointer-events:none;border-radius:2px;}",
       ".pdfhl-marquee-pending{border-style:solid;background:rgba(31,31,31,.18);}",

@@ -2,7 +2,7 @@
 
 PDF Highlighter is a [Thymer](https://thymer.com) plugin for highlighting text in a PDF attached to a note and pulling it straight into the note. Open a PDF and select a passage, and the text lands in your note as a colour-coded quote, grouped under a **Highlights** heading and tagged with a clickable backlink to the exact page. Click the backlink any time to jump back into the PDF, where the plugin scrolls to the passage and pulses your highlight. The highlight stays painted over the text in the PDF too, and survives reloads.
 
-**There's a tool rail for the rest of it.** Underline and strike text, capture a whole region in one drag, draw rectangles, ellipses, lines, arrows and freehand over the page, and write your own comment instead of a quote. Everything you mark lands in the note, so the note is always the record of what you did.
+**There's a tool rail for the rest of it.** Underline and strike text, capture a whole region in one drag, draw over the page, type straight onto it, and write your own comment instead of a quote. When you're done, export a copy of the PDF with the markup drawn in.
 
 **Scanned PDFs work too.** On an image-only page (no selectable text), drag a box around the text instead of selecting it; the plugin runs OCR on that region and drops the recognised text into your note with the same colour, backlink, and overlay.
 
@@ -28,25 +28,38 @@ A compact rail floats over the left edge of the PDF panel. Each button shows wha
 
 **Text** marks the selection, and holds two independent choices that combine:
 
-![Highlight, underline, strikethrough or area capture, as a citation or a comment](screenshots/text-tools.png)
+![Highlight, underline, area capture or strikethrough, as a citation or a comment](screenshots/text-modes.png)
 
 - **Highlight**, **Underline** and **Strikethrough** decide how the PDF is marked. A strikethrough files its note in a **warning** block.
 - **Area** swaps text-selection for a box: drag over a column or a whole paragraph and the text inside is captured. On a page with real text that is exact, character for character; on a scanned page the same drag runs OCR instead.
 - **Citation** puts the quoted passage in the note. **Comment** gives you an empty block to write in.
 
+**Text Box** types straight onto the page. What you type appears in the note as a plain heading with a linked arrow back to the spot:
+
+![Typing directly onto the PDF](screenshots/text-box.png)
+
 **Shapes** draws over the page. Every shape writes a note block with a line to say why it's there:
 
-![Rectangle, ellipse, line, arrow and freehand](screenshots/shape-tools.png)
+![Rectangle, ellipse, line, arrow and freehand](screenshots/shape-modes.png)
 
-With the **Select** arrow, click a shape to select it, drag it to move it, drag a handle to resize it, and press **Delete** to remove it.
+With the **Select** arrow, click a shape or text box to select it, drag it to move it, drag a handle to resize a shape, and press **Delete** to remove it. **⌘Z** and **⌘⇧Z** undo and redo your markup — inside the PDF only, so Thymer keeps its own undo in the note.
 
 **Style** sets colour, fill, line type, thickness and opacity — for new marks, or for whatever you have selected:
 
-![Colour, fill, line type, thickness and opacity](screenshots/style.png)
+![Colour, fill, line type, thickness and opacity](screenshots/styling.png)
 
-Right-click any shape or highlight to open the same panel at the cursor, with a delete button. The **?** button lists every gesture, in case you forget one.
+Right-click any shape, text box or highlight to open the same panel at the cursor, with a delete button. The **?** button lists every gesture, in case you forget one.
 
 **On a scanned (image-only) page** there's no text to select, so instead **drag a box** around the text you want. The plugin OCRs that region (first use downloads the recognition engine, which takes a moment) and adds the recognised text to your note in your current colour, with the same backlink, overlay, and delete. Drawing a snug box around just the lines you want gives the cleanest result.
+
+## Export
+
+The **download** button in the rail saves `<filename> (annotated).pdf` beside your downloads, with everything you marked drawn into it.
+
+The markup is written as real vector objects, not a flattened image, so the PDF's text stays selectable and searchable, the file stays small, and it prints correctly from any reader. Text boxes become real PDF text. Highlights, underlines and strikethroughs keep their colour and weight; shapes keep their fill, line type and opacity.
+
+One thing to know: a highlight is positioned by finding its text again in the page, which only happens for pages that have been rendered. If you export straight after a reload, marks on pages you haven't opened yet are skipped and the plugin tells you how many. Scroll through those pages once and export again. Shapes and text boxes carry their own coordinates, so they are never affected.
+
 
 Good to know:
 
@@ -55,7 +68,8 @@ Good to know:
 - **Highlights persist.** They're reconstructed from the note's text, so they come back after a reload even if the PDF was closed — as long as the note is open beside the PDF.
 - **Lossless text on real PDFs.** When a page has a text layer, the plugin reads the actual characters, so the extracted text is exact (no OCR errors). Scanned pages fall back to OCR automatically.
 - **Group under a heading, or not.** Extracts sit under a **Highlights** heading by default. Run **PDF Highlighter: Toggle Highlights heading** from the Command Palette (`Cmd+P` / `Ctrl+P`) to instead drop new extracts at the end of the note.
-- **Your settings are remembered** across reloads — colours, line type, thickness, opacity, OCR language, the text mode and the heading setting.
+- **Your settings are remembered** across reloads — colours, line type, thickness, opacity, text size, OCR language, the text mode and the heading setting.
+- **Undo covers the markup.** Creating, deleting, moving, resizing, restyling and merging quotes are all reversible with **⌘Z** while you're in the PDF.
 - **It follows your theme.** The rail, menus and panels use Thymer's own colours, and a selected shape is outlined in your theme's accent, so it fits whichever of Thymer's themes you use.
 
 ## Scanned PDFs (OCR)

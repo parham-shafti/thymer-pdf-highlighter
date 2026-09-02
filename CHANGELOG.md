@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.5.0 — 2026-09-02
+
+- **Export an annotated PDF.** The download button in the tool rail saves a copy of the PDF with your markup drawn into it. It's written as real vector objects, not a flattened image, so the text stays selectable and searchable and it prints correctly from any reader.
+- **Type on the page.** A new **Text Box** tool writes directly onto the PDF. What you type appears in the note as a plain heading with a linked arrow back to the spot, and exports as real PDF text — selectable and searchable in the exported file.
+- **Undo and redo.** **⌘Z** and **⌘⇧Z** cover creating, deleting, moving, resizing, restyling and merging quotes. They work inside the PDF only, so Thymer keeps its own undo in the note. Dragging a slider counts as one step, not forty.
+- **Fixes.** Backlinks now scroll to shapes and text boxes, not just highlights. Marks are hit-tested against what is actually drawn, so a text box can be selected, moved, recoloured and deleted reliably. The Text Box tool now uses the shape palette it actually draws with, so the colour you pick is the colour you get. Deleting the last mark under the Highlights heading no longer removes the heading itself.
+
 ## v2.4.0 — 2026-08-24
 
 - **A tool rail over the PDF.** Four compact buttons — Select, Text, Shapes and Style — each showing what it will do. A click uses the tool; its menu opens from the button's bottom edge or a right-click.
