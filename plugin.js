@@ -94,6 +94,7 @@ class Plugin extends AppPlugin {
     this.NOTE_MODES = [
       { key: "citation", label: "Citation", svg: '<path d="M8.4 5.2 C5.6 6.4 4 8.6 4 11.2 C4 13.3 5.3 14.8 7.1 14.8 C8.7 14.8 9.9 13.6 9.9 12.1 C9.9 10.6 8.8 9.5 7.3 9.5 C7 9.5 6.7 9.6 6.5 9.6 C6.9 8.2 7.9 7.1 9.3 6.4 Z M16.1 5.2 C13.3 6.4 11.7 8.6 11.7 11.2 C11.7 13.3 13 14.8 14.8 14.8 C16.4 14.8 17.6 13.6 17.6 12.1 C17.6 10.6 16.5 9.5 15 9.5 C14.7 9.5 14.4 9.6 14.2 9.6 C14.6 8.2 15.6 7.1 17 6.4 Z" fill="currentColor"/>' },
       { key: "comment",  label: "Comment",  svg: '<path d="M3.4 5.2 A1.8 1.8 0 0 1 5.2 3.4 H14.8 A1.8 1.8 0 0 1 16.6 5.2 V11.6 A1.8 1.8 0 0 1 14.8 13.4 H8.4 L5 16.4 V13.4 H5.2 A1.8 1.8 0 0 1 3.4 11.6 Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>' },
+      { key: "none",     label: "PDF Only", svg: '<path d="M4.4 4.4 H15.6 V15.6 H4.4 Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="2.6,2"/><path d="M7.2 10.2 L9.3 12.3 L13 8.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>' },
     ];
     this._shapeColor = "red";   // stroke colour for new shapes
     this._shapeWidth = 0.003;   // stroke width as a fraction of page width (scales with zoom)
@@ -387,6 +388,16 @@ class Plugin extends AppPlugin {
       e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
       this._exportAnnotatedPdf(hook);
     };
+    // Double-click a text box to rewrite it.
+    const onDblClick = (e) => {
+      const hid = this._shapeAtPoint(hook, e.clientX, e.clientY);
+      if (!hid) return;
+      const entry = (this._getStore()[hook.fingerprint] || []).find((x) => x.hid === hid && x.shape && x.shape.type === "text");
+      if (!entry) return;
+      e.preventDefault(); e.stopPropagation();
+      this._editTextBox(hook, hid);
+    };
+    doc.addEventListener("dblclick", onDblClick, true);
     doc.addEventListener("click", onNativeDownload, true);
     // Thymer's OWN toolbar (the ◁ n/N ▷ · zoom · rotate · download · print strip) lives in
     // Thymer's document above the iframe, not inside pdf.js: a plain minimal button whose
@@ -402,17 +413,18 @@ class Plugin extends AppPlugin {
     };
     document.addEventListener("click", onPanelDownload, true);
     const onKeyDown = (e) => {
-      // 1-5 pick a tool, top to bottom. Bare digits only, and never while typing — the
-      // text-box editor and pdf.js's find bar both need their numbers. This listener is on
-      // the capture phase, so it would otherwise steal the keystroke before they see it.
-      if (!e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && /^[1-5]$/.test(e.key)) {
-        const t = e.target;
-        const typing = !!(t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || "")));
-        if (!typing) {
-          e.preventDefault(); e.stopPropagation();
-          this._railShortcut(hook, e.key);
-          return;
-        }
+      // This listener is on the CAPTURE phase, so it sees every key before the element that
+      // was typed into. While a field has focus it must keep its hands off completely: the
+      // text-box editor and pdf.js's find bar need their own digits, Escape, ⌘Z — and
+      // Backspace, which used to delete the selected shape while you were fixing a typo.
+      const t = e.target;
+      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ""))) return;
+      // 1-5 pick a tool top to bottom, 6-8 pick what the note gets. Digits, not letters:
+      // pdf.js owns p/n/j/k/r/h/s, and stealing those would break its own navigation.
+      if (!e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && /^[1-8]$/.test(e.key)) {
+        e.preventDefault(); e.stopPropagation();
+        this._railShortcut(hook, e.key);
+        return;
       }
       // Bound to the VIEWER only: in the note, ⌘Z stays Thymer's own undo.
       if ((e.metaKey || e.ctrlKey) && String(e.key).toLowerCase() === "z") {
@@ -459,6 +471,15 @@ class Plugin extends AppPlugin {
     try { app.eventBus.on("textlayerrendered", onRendered); } catch (e) {}
     try { app.eventBus.on("pagerendered", onRendered); } catch (e) {}
     try { app.eventBus.on("pagesloaded", onRendered); } catch (e) {}
+    // Zooming re-renders every page, which destroys the overlays living inside them. The
+    // page events alone land too early, so force a rebuild once the new scale has settled.
+    const onScale = () => {
+      [150, 500, 1100].forEach((ms) => setTimeout(() => {
+        if (iframe.isConnected) this._rebuildFromNote(hook, true);
+      }, ms));
+    };
+    try { app.eventBus.on("scalechanging", onScale); } catch (e) {}
+    try { app.eventBus.on("rotationchanging", onScale); } catch (e) {}
 
     // BULLETPROOF redraw: watch the viewer DOM and redraw whenever a text layer
     // appears. This is timing-independent — it catches a cold reload (where the
@@ -480,6 +501,7 @@ class Plugin extends AppPlugin {
       try { doc.removeEventListener("contextmenu", onCtx, true); } catch (e) {}
       try { doc.removeEventListener("keyup", onKeyUp, true); } catch (e) {}
       try { doc.removeEventListener("keydown", onKeyDown, true); } catch (e) {}
+      try { doc.removeEventListener("dblclick", onDblClick, true); } catch (e) {}
       try { doc.removeEventListener("click", onNativeDownload, true); } catch (e) {}
       try { document.removeEventListener("click", onPanelDownload, true); } catch (e) {}
       try { window.removeEventListener("keyup", onKeyUp, true); } catch (e) {}
@@ -487,6 +509,9 @@ class Plugin extends AppPlugin {
       try { app.eventBus.off("textlayerrendered", onRendered); } catch (e) {}
       try { app.eventBus.off("pagerendered", onRendered); } catch (e) {}
       try { app.eventBus.off("pagesloaded", onRendered); } catch (e) {}
+      try { app.eventBus.off("scalechanging", onScale); } catch (e) {}
+      try { app.eventBus.off("rotationchanging", onScale); } catch (e) {}
+      try { if (hook._rebuildPending) { clearTimeout(hook._rebuildPending); hook._rebuildPending = null; } } catch (e) {}
       try { tlObserver.disconnect(); } catch (e) {}
       try { this._cancelMarquee(hook); } catch (e) {}
       try { this._cancelOcrBoxes(hook); } catch (e) {}
@@ -520,6 +545,12 @@ class Plugin extends AppPlugin {
     this._rebuildFromNote(hook); // re-derive overlays from the durable note text
     // The note's lines can arrive well after the viewer does, and once the pages have
     // rendered nothing else triggers a rebuild. Keep asking until it answers, then stop.
+    // Catch-up: marks made before the note had its property (or on a device that was
+    // offline) live only in localStorage. Push them up once the note has had time to load.
+    setTimeout(() => {
+      if (!iframe.isConnected) return;
+      if ((this._getLocal()[hook.fingerprint] || []).length) this._writeMarksToNote(hook);
+    }, 2500);
     let tries = 0;
     const retry = () => {
       if (!iframe.isConnected) return;
@@ -587,7 +618,7 @@ class Plugin extends AppPlugin {
       return;
     }
     const note = this._findAssociatedNote(hook.iframe);
-    if (!note) {
+    if (!note && this._noteMode !== "none") {
       this.ui.addToaster({ title: "No note found", message: "Open the PDF beside its note, then highlight.", dismissible: true });
       return;
     }
@@ -609,7 +640,31 @@ class Plugin extends AppPlugin {
   // Shared by the text-selection and OCR paths. For OCR, `ocrRects` are the marquee
   // rectangles (normalised, one per box) — encoded in the backlink so the overlay is
   // fully reconstructable from the note alone (a scanned page has no text layer to match).
-  async _commitExtract(hook, note, { paragraphs, page, color, rectsByPage, ocrRects, mode, shape, mark, markWidth, forceHid, silent }) {
+  // Writing a line makes Thymer put the caret on it, so the keyboard belongs to the note the
+  // instant a mark is made. That turned the rail's number keys into stray digits typed into
+  // his notes. Every commit hands the keyboard back to the viewer.
+  async _commitExtract(hook, note, opts) {
+    const r = await this._commitExtractInner(hook, note, opts);
+    this._refocusViewer(hook);
+    return r;
+  }
+
+  _refocusViewer(hook) {
+    const go = () => {
+      try {
+        if (!hook || !hook.iframe || !hook.iframe.isConnected) return;
+        const ae = document.activeElement;
+        if (ae && ae !== document.body && typeof ae.blur === "function" && !hook.iframe.contains(ae)) ae.blur();
+        hook.iframe.contentWindow.focus();
+      } catch (e) {}
+    };
+    go();
+    // Thymer places the caret asynchronously after the write, so once is not enough.
+    setTimeout(go, 80);
+    setTimeout(go, 260);
+  }
+
+  async _commitExtractInner(hook, note, { paragraphs, page, color, rectsByPage, ocrRects, mode, shape, mark, markWidth, forceHid, silent }) {
     mode = mode || "normal";
     mark = mark || "fill";
     const quote = paragraphs.join("\n\n");
@@ -623,7 +678,11 @@ class Plugin extends AppPlugin {
     // A drawn shape carries its geometry and style in the backlink, so the markup is
     // reconstructable from the note alone (same trick as the OCR rectangles).
     else if (shape && shape.type === "text") backlink += "&shape=text&geom=" + this._encShapeGeom(shape) +
-      "&stroke=" + shape.stroke + "&size=" + Number(shape.size).toFixed(5);
+      "&stroke=" + shape.stroke + "&size=" + Number(shape.size).toFixed(5) +
+      // A Thymer line holds no line break, so the heading shows the text flattened while
+      // the link carries it exactly. The heading still wins if it was edited in Thymer.
+      "&text=" + encodeURIComponent(shape.content || "");
+
     else if (shape) backlink += "&shape=" + shape.type + "&geom=" + this._encShapeGeom(shape) +
       "&stroke=" + shape.stroke + "&sw=" + Number(shape.sw).toFixed(5) +
       "&fill=" + (shape.fill ? 1 : 0) + "&op=" + Number(shape.op != null ? shape.op : 1).toFixed(2) +
@@ -633,6 +692,41 @@ class Plugin extends AppPlugin {
     else if (mode === "link") {
       const lr = (rectsByPage && rectsByPage[page]) || [];
       if (lr.length) backlink += "&link=1&rect=" + encRects(lr);
+    }
+
+    // PDF ONLY: mark the page and write nothing anywhere else. Kept in its own store,
+    // since the note can't rebuild what it was never told about.
+    if (this._noteMode === "none" && mode !== "append") {
+      const rec = {
+        hid, page, color: color.key, rectsByPage: rectsByPage || {}, quote: "",
+        mark, mw: markWidth || this._markWidth, shape: shape || null, local: true,
+      };
+      const local = this._getLocal();
+      (local[hook.fingerprint] = local[hook.fingerprint] || []).push(rec);
+      this._setLocal(local);
+      const store = this._getStore();
+      (store[hook.fingerprint] = store[hook.fingerprint] || []).push(rec);
+      this._setStore(store);
+      this._writeMarksToNote(hook);
+      this._redrawOverlays(hook);
+      this._redrawShapes(hook);
+      if (!silent) {
+        this._pushUndo({
+          label: shape ? "shape" : "mark",
+          undo: () => this._deleteHighlight(hook, hid, true),
+          redo: async () => {
+            const l = this._getLocal();
+            (l[hook.fingerprint] = l[hook.fingerprint] || []).push(rec);
+            this._setLocal(l);
+            const st = this._getStore();
+            (st[hook.fingerprint] = st[hook.fingerprint] || []).push(rec);
+            this._setStore(st);
+            this._writeMarksToNote(hook);
+            this._redrawOverlays(hook); this._redrawShapes(hook);
+          },
+        });
+      }
+      return hid;
     }
 
     // APPEND (⌘): add these paragraphs into the previous quote block instead of a new one.
@@ -723,7 +817,7 @@ class Plugin extends AppPlugin {
         // of its own; the arrow icon beside it is what you click (the backlink handler
         // matches an icon whose previous sibling is one of our links).
         li.setSegments([
-          { type: "text", text: shape.content || "" }, // no trailing space: the icon already carries a 4px margin
+          { type: "text", text: String(shape.content || "").replace(/\s*\n\s*/g, " ") }, // one line: the icon carries the 4px gap
           { type: "linkobj", text: { link: backlink, title: "" } },
           { type: "icon", text: "ti-arrow-up-right" },
         ]);
@@ -1006,9 +1100,11 @@ class Plugin extends AppPlugin {
       const g2 = item.shape.geom || [];
       if (g2.length < 2) return;
       const size = Math.max(2, (item.shape.size || 0.022) * g.DW);
-      const at = g.pt(g2[0], g2[1] + (g2[3] || 0));   // baseline sits at the box's bottom
+      // Multi-line text runs DOWNWARD from the first baseline, so anchor at the box's top,
+      // not its bottom, and hand pdf-lib the same line height the overlay uses.
+      const top = g.pt(g2[0], g2[1]);
       page.drawText(String(item.shape.content || ""), {
-        x: at.x, y: at.y + size * 0.22, size: size,
+        x: top.x, y: top.y - size * 0.84, size: size, lineHeight: size * 1.25,
         font: item.font, color: toColor(this._shapeRgb(item.shape.stroke)),
       });
       return;
@@ -1224,7 +1320,11 @@ class Plugin extends AppPlugin {
       () => this._setShapeTool(hook, this._shapeTool),
       (b) => this._openFlyout(hook, b, [
         { items: this.SHAPE_TOOLS, current: this._isShapeTool() ? this._tool : this._shapeTool },
-      ], (k) => this._setShapeTool(hook, k)));
+        { items: this.NOTE_MODES, current: this._noteMode },
+      ], (k) => {
+        if (this.NOTE_MODES.some((n) => n.key === k)) { this._setNoteMode(k); this._syncToolRails(); return; }
+        this._setShapeTool(hook, k);
+      }));
     // Style button: opens the colour / fill / thickness / opacity panel.
     const sep = doc.createElement("div");
     sep.style.cssText = "height:1px;background:rgba(128,128,128,.4);margin:5px 3px;";
@@ -1575,6 +1675,7 @@ class Plugin extends AppPlugin {
     }
     Object.assign(entry.shape, patch);
     this._setStore(store);
+    if (entry.local) { this._setLocal(this._getLocal()); this._writeMarksToNote(hook); }
     this._redrawShapes(hook);
     try {
       const note = this._findAssociatedNote(hook.iframe);
@@ -1652,6 +1753,18 @@ class Plugin extends AppPlugin {
       "border:1px solid var(--color-bg-600,#33383c);box-shadow:0 10px 32px rgba(0,0,0,.5);" +
       "font:12.5px/1.5 var(--font-sans,system-ui),system-ui,-apple-system,sans-serif;";
     const SECTIONS = [
+      ["Tools", [
+        ["1", "Select"],
+        ["2", "Text"],
+        ["3", "Text Box"],
+        ["4", "Shapes"],
+        ["5", "Style panel"],
+      ]],
+      ["What the note gets", [
+        ["6", "Citation, the quoted passage"],
+        ["7", "Comment, an empty block to write in"],
+        ["8", "PDF Only, nothing written to the note"],
+      ]],
       ["Text", [
         ["Drag", "Mark the selection"],
         ["⌘ + drag", "Merge into the previous quote"],
@@ -1661,16 +1774,14 @@ class Plugin extends AppPlugin {
       ]],
       ["Text box", [
         ["Click", "Place a box and type on the page"],
-        ["Enter", "Keep it (Shift+Enter for a new line)"],
+        ["Double-click", "Rewrite an existing box"],
+        ["Shift + Enter", "New line"],
+        ["Enter", "Keep it"],
         ["Esc", "Discard it"],
       ]],
       ["Shapes", [
         ["Drag", "Draw the selected shape"],
         ["Esc", "Cancel the shape being drawn"],
-      ]],
-      ["History", [
-        ["⌘Z", "Undo the last mark"],
-        ["⌘⇧Z", "Redo it"],
       ]],
       ["Select", [
         ["Click", "Select a shape"],
@@ -1679,16 +1790,22 @@ class Plugin extends AppPlugin {
         ["Delete", "Remove the selected shape"],
         ["Right-click", "Style panel for a shape or highlight"],
       ]],
+      ["History", [
+        ["⌘Z", "Undo the last mark"],
+        ["⌘⇧Z", "Redo it"],
+      ]],
       ["Style panel", [
         ["Enter", "Keep the changes"],
         ["Esc", "Undo them"],
       ]],
       ["Tool rail", [
-        ["1 - 5", "Pick a tool, top to bottom"],
-        ["Export", "Save a copy of the PDF with your markup"],
         ["Click", "Use the tool shown"],
         ["Bottom edge", "Open its menu"],
         ["Right-click", "Open its menu"],
+      ]],
+      ["Export", [
+        ["Rail arrow", "Save a copy with your markup drawn in"],
+        ["Viewer arrow", "The same thing, either one works"],
       ]],
     ];
     for (let i = 0; i < SECTIONS.length; i++) {
@@ -1859,10 +1976,14 @@ class Plugin extends AppPlugin {
   // The Text menu holds two independent choices: how the PDF is marked, and what the note
   // gets. They combine — e.g. Underline + Comment underlines the passage and gives you an
   // empty block to write in.
+  _setNoteMode(key) {
+    this._noteMode = key;
+    try { window.localStorage.setItem("pdfhl_noteMode", key); } catch (e) {}
+  }
+
   _setTextChoice(hook, key) {
     if (this.NOTE_MODES.some((n) => n.key === key)) {
-      this._noteMode = key;
-      try { window.localStorage.setItem("pdfhl_noteMode", key); } catch (e) {}
+      this._setNoteMode(key);
       this._tool = "text";
       this._syncToolRails();
       return;
@@ -1870,7 +1991,7 @@ class Plugin extends AppPlugin {
     this._setTextMark(hook, key);
   }
 
-  // The rail, by number: 1 Select, 2 Text, 3 Text Box, 4 Shapes, 5 Style.
+  // 1 Select, 2 Text, 3 Text Box, 4 Shapes, 5 Style, then 6 Citation, 7 Comment, 8 PDF Only.
   _railShortcut(hook, n) {
     this._closeFlyout();
     this._closeShortcuts();
@@ -1881,6 +2002,14 @@ class Plugin extends AppPlugin {
     else if (n === "5") {
       const b = hook.rail && hook.rail.querySelector(".pdfhl-style-btn");
       if (b) this._toggleStylePanel(hook, b);
+    } else {
+      // Changing what the note gets is invisible until a menu is opened, so say it.
+      const key = { "6": "citation", "7": "comment", "8": "none" }[n];
+      const mode = this.NOTE_MODES.find((m) => m.key === key);
+      if (!mode) return;
+      this._setNoteMode(key);
+      this._syncToolRails();
+      this.ui.addToaster({ title: mode.label, dismissible: true, autoDestroyTime: 1300 });
     }
   }
 
@@ -1997,7 +2126,7 @@ class Plugin extends AppPlugin {
 
   async _commitShape(hook, page, shape) {
     const note = this._findAssociatedNote(hook.iframe);
-    if (!note) {
+    if (!note && this._noteMode !== "none") {
       this.ui.addToaster({ title: "No note found", message: "Open the PDF beside its note, then draw.", dismissible: true });
       return;
     }
@@ -2114,7 +2243,18 @@ class Plugin extends AppPlugin {
       el.setAttribute("font-family", "system-ui,-apple-system,sans-serif");
       el.setAttribute("fill", "rgb(" + rgb + ")");
       el.setAttribute("stroke", "none");
-      el.textContent = shape.content || "";
+      // An SVG <text> renders newlines as nothing at all, so each line is its own tspan.
+      const lines = String(shape.content || "").split("\n");
+      if (lines.length === 1) el.textContent = lines[0];
+      else {
+        lines.forEach((ln, i) => {
+          const ts = doc.createElementNS(NS, "tspan");
+          ts.setAttribute("x", g2[0] * W);
+          if (i) ts.setAttribute("dy", fontPx * 1.25);
+          ts.textContent = ln || " ";
+          el.appendChild(ts);
+        });
+      }
       el.setAttribute("opacity", shape.op != null ? shape.op : 1);
       if (hid) el.setAttribute("data-hid", hid);
       return el;
@@ -2265,21 +2405,43 @@ class Plugin extends AppPlugin {
   // Type straight onto the page. The typed text becomes an H3 line in the note, so it is
   // still recoverable from there like every other mark.
   _startTextBox(hook, pageEl, e) {
-    this._closeTextEditor(hook);
     const ref = pageEl.querySelector(".textLayer") || pageEl.querySelector("canvas");
     if (!ref) return;
     const box = ref.getBoundingClientRect();
     if (!box.width || !box.height) return;
     const page = parseInt(pageEl.getAttribute("data-page-number"), 10) || this._currentPage(hook);
-    const nx = (e.clientX - box.left) / box.width, ny = (e.clientY - box.top) / box.height;
-    const fontPx = Math.max(8, this._textSize * box.width);
+    this._openTextEditor(hook, pageEl, ref, box, page,
+      (e.clientX - box.left) / box.width, (e.clientY - box.top) / box.height, null);
+  }
+
+  // Re-open an existing text box for editing (double-click). Same editor, pre-filled, and
+  // the committed text replaces the note's heading instead of adding a new one.
+  _editTextBox(hook, hid) {
+    const entry = (this._getStore()[hook.fingerprint] || []).find((h) => h.hid === hid && h.shape && h.shape.type === "text");
+    if (!entry) return;
+    const pageEl = [...hook.doc.querySelectorAll(".page")].find((pe) => parseInt(pe.getAttribute("data-page-number"), 10) === entry.page);
+    if (!pageEl) return;
+    const ref = pageEl.querySelector(".textLayer") || pageEl.querySelector("canvas");
+    if (!ref) return;
+    const box = ref.getBoundingClientRect();
+    if (!box.width || !box.height) return;
+    const g = entry.shape.geom || [];
+    this._openTextEditor(hook, pageEl, ref, box, entry.page, g[0] || 0, g[1] || 0, {
+      hid: hid, content: entry.shape.content || "",
+      size: entry.shape.size || this._textSize, color: entry.shape.stroke || this._shapeColor,
+    });
+  }
+
+  _openTextEditor(hook, pageEl, ref, box, page, nx, ny, existing) {
+    this._closeTextEditor(hook);
+    const fontPx = Math.max(8, (existing ? existing.size : this._textSize) * box.width);
     const ed = hook.doc.createElement("div");
     ed.className = "pdfhl-text-editor";
     ed.setAttribute("contenteditable", "true");
     ed.style.cssText = "position:absolute;left:" + (nx * 100) + "%;top:" + (ny * 100) + "%;" +
       "min-width:20px;z-index:6;outline:none;white-space:pre;line-height:1.25;" +
       "font:" + fontPx + "px/1.25 system-ui,-apple-system,sans-serif;" +
-      "color:rgb(" + this._shapeRgb(this._shapeColor) + ");" +
+      "color:rgb(" + this._shapeRgb(existing ? existing.color : this._shapeColor) + ");" +
       "box-shadow:0 0 0 1px " + this._accentRgba(0.9) + ";padding:0 2px;background:rgba(255,255,255,.7);";
     let layer = pageEl.querySelector(".pdfhl-textedit-layer");
     if (!layer) {
@@ -2289,14 +2451,31 @@ class Plugin extends AppPlugin {
         "px;width:" + ref.offsetWidth + "px;height:" + ref.offsetHeight + "px;z-index:6;";
       pageEl.appendChild(layer);
     }
+    if (hook.selectedShape) hook.selectedShape = null; // nothing selected behind the editor
+    if (existing) ed.textContent = existing.content;
     layer.appendChild(ed);
-    hook.textEdit = { ed, layer, page, nx, ny, box };
-    setTimeout(() => { try { ed.focus(); } catch (er) {} }, 0);
+    hook.textEdit = { ed, layer, page, nx, ny, box, existing: existing || null };
+    if (existing) this._redrawShapes(hook); // hide the drawn copy while its editor is open
+    setTimeout(() => {
+      try {
+        ed.focus();
+        const r = hook.doc.createRange(); r.selectNodeContents(ed);
+        const sel = hook.win.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+        if (!existing) sel.collapseToEnd();
+      } catch (er) {}
+    }, 0);
     const done = (commit) => { if (commit) this._commitTextBox(hook); else this._closeTextEditor(hook); };
     ed.addEventListener("keydown", (ev) => {
       ev.stopPropagation();
       if (ev.key === "Escape") { ev.preventDefault(); done(false); }
-      else if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); done(true); }
+      else if (ev.key === "Enter" && ev.shiftKey) {
+        // The editor is white-space:pre, so a literal newline is the break. Left to the
+        // browser this inserts a <br>, which textContent then silently drops.
+        ev.preventDefault();
+        try { hook.doc.execCommand("insertText", false, "\n"); }
+        catch (er) { try { hook.doc.execCommand("insertLineBreak"); } catch (er2) {} }
+      }
+      else if (ev.key === "Enter") { ev.preventDefault(); done(true); }
     });
     ed.addEventListener("blur", () => setTimeout(() => done(true), 0));
   }
@@ -2304,12 +2483,20 @@ class Plugin extends AppPlugin {
   async _commitTextBox(hook) {
     const t = hook.textEdit;
     if (!t) return;
-    const content = String(t.ed.textContent || "").replace(/\s+/g, " ").trim();
+    // innerText honours the rendered line breaks; textContent does not. Collapse runs of
+    // spaces but never newlines.
+    const content = String(t.ed.innerText || t.ed.textContent || "")
+      .replace(/\r/g, "")
+      .replace(/[ \t]+/g, " ")
+      .replace(/[ \t]*\n[ \t]*/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
     const w = t.ed.offsetWidth, h = t.ed.offsetHeight;
     this._closeTextEditor(hook);
     if (!content) return;
+    if (t.existing) { await this._applyTextEdit(hook, t.existing.hid, content, w / t.box.width, h / t.box.height); return; }
     const note = this._findAssociatedNote(hook.iframe);
-    if (!note) {
+    if (!note && this._noteMode !== "none") {
       this.ui.addToaster({ title: "No note found", message: "Open the PDF beside its note, then type.", dismissible: true });
       return;
     }
@@ -2323,12 +2510,70 @@ class Plugin extends AppPlugin {
     });
   }
 
+  // Rewriting an existing text box: the note's heading IS the content, so the edit lands
+  // there as well as in the store. Its backlink and id are untouched.
+  async _applyTextEdit(hook, hid, content, w, h) {
+    const store = this._getStore();
+    const entry = (store[hook.fingerprint] || []).find((x) => x.hid === hid && x.shape);
+    if (!entry) return;
+    const before = entry.shape.content || "";
+    const beforeGeom = (entry.shape.geom || []).slice();
+    if (content === before) { this._redrawShapes(hook); return; }
+    const apply = async (text, geomW, geomH) => {
+      const st = this._getStore();
+      const en = (st[hook.fingerprint] || []).find((x) => x.hid === hid && x.shape);
+      if (!en) return;
+      en.shape.content = text;
+      const g = en.shape.geom || [];
+      if (g.length >= 4 && geomW != null) { g[2] = geomW; g[3] = geomH; }
+      this._setStore(st);
+      this._redrawShapes(hook);
+      try {
+        const note = this._findAssociatedNote(hook.iframe);
+        if (!note) return;
+        const items = (await note.getLineItems()) || [];
+        for (const li of items) {
+          const segs = li.segments || [];
+          const link = segs.find((sg) => sg && sg.type === "linkobj" && sg.text &&
+            typeof sg.text.link === "string" && sg.text.link.indexOf("hid=" + hid) !== -1);
+          if (!link) continue;
+          // The heading can only hold one line, so the LINK carries the exact text (and the
+          // box's new size). Rewritten in the same write, or a reload would lose the breaks.
+          let url = link.text.link;
+          const setParam = (k, v) => {
+            url = new RegExp("[?&]" + k + "=").test(url)
+              ? url.replace(new RegExp("([?&]" + k + "=)[^&]*"), "$1" + v)
+              : url + "&" + k + "=" + v;
+          };
+          setParam("text", encodeURIComponent(text));
+          if (geomW != null) {
+            const en2 = (this._getStore()[hook.fingerprint] || []).find((x) => x.hid === hid && x.shape);
+            if (en2) setParam("geom", this._encShapeGeom(en2.shape));
+          }
+          li.setSegments([
+            { type: "text", text: String(text).replace(/\s*\n\s*/g, " ") },
+            { type: "linkobj", text: { link: url, title: link.text.title || "" } },
+            { type: "icon", text: "ti-arrow-up-right" },
+          ]);
+          break;
+        }
+      } catch (e) {}
+    };
+    await apply(content, w, h);
+    this._pushUndo({
+      label: "edit text",
+      undo: () => apply(before, beforeGeom[2], beforeGeom[3]),
+      redo: () => apply(content, w, h),
+    });
+  }
+
   _closeTextEditor(hook) {
     const t = hook && hook.textEdit;
     if (!t) return;
     try { t.ed.remove(); } catch (e) {}
     try { if (t.layer && !t.layer.children.length) t.layer.remove(); } catch (e) {}
     hook.textEdit = null;
+    if (t.existing) { try { this._redrawShapes(hook); } catch (e) {} } // bring the drawn copy back
   }
 
   // ---- move & resize -------------------------------------------------------
@@ -2509,6 +2754,7 @@ class Plugin extends AppPlugin {
           const sel = this._selectionEl(doc, h.shape, W, H, accent);
           if (sel) svg.appendChild(sel);
         }
+        if (hook.textEdit && hook.textEdit.existing && hook.textEdit.existing.hid === h.hid) continue;
         const el = this._shapeEl(doc, h.shape, W, H, h.hid);
         if (el) svg.appendChild(el);
         if (h.hid === hook.selectedShape) {
@@ -3407,6 +3653,12 @@ class Plugin extends AppPlugin {
         }
       } catch (e) {}
     }
+    const localMap = this._getLocal();
+    if ((localMap[hook.fingerprint] || []).some((x) => x.hid === hid)) {
+      localMap[hook.fingerprint] = localMap[hook.fingerprint].filter((x) => x.hid !== hid);
+      this._setLocal(localMap);
+      this._writeMarksToNote(hook);
+    }
     const store = this._getStore();
     if (store[hook.fingerprint]) {
       store[hook.fingerprint] = store[hook.fingerprint].filter((h) => h.hid !== hid);
@@ -3507,12 +3759,41 @@ class Plugin extends AppPlugin {
   // DURABLE persistence: the note (which always survives reload) is the source of
   // truth. Re-derive each highlight's overlay rects by finding its extracted text
   // back in the PDF's text layer. The config store is only a fast in-session cache.
-  async _rebuildFromNote(hook) {
+  async _rebuildFromNote(hook, force) {
     const now = Date.now();
-    if (hook._rebuildAt && now - hook._rebuildAt < 350) return; // throttle
+    if (!force && hook._rebuildAt && now - hook._rebuildAt < 350) {
+      // Leading-edge only would DROP the final call of a burst, and during a zoom that is
+      // the one that matters: pdf.js tears every page down and rebuilds it, taking our
+      // overlay layers with it, so the last rebuild is what puts the markup back. Queue a
+      // trailing run instead of discarding it.
+      if (!hook._rebuildPending) {
+        hook._rebuildPending = setTimeout(() => {
+          hook._rebuildPending = null;
+          this._rebuildFromNote(hook, true);
+        }, 420);
+      }
+      return;
+    }
     hook._rebuildAt = now;
     const note = this._findAssociatedNote(hook.iframe);
-    if (!note) return; // can't reach the note — keep whatever the store has
+    if (!note) {
+      // No note beside the PDF. A phone shows one panel at a time, so this is the NORMAL
+      // case there, not an error. Note-backed marks genuinely cannot be derived without it,
+      // but PDF Only marks can: they live in the plugin's own synced page. Gating the whole
+      // redraw on the note meant a phone drew nothing at all.
+      await this._readMarksFromNote(hook);
+      const own = this._getLocal()[hook.fingerprint] || [];
+      if (own.length) {
+        const st = this._getStore();
+        const merged = (st[hook.fingerprint] || []).slice();
+        for (const m of own) if (!merged.some((x) => x.hid === m.hid)) merged.push(m);
+        st[hook.fingerprint] = merged;
+        this._setStore(st);
+      }
+      this._redrawOverlays(hook);
+      this._redrawShapes(hook);
+      return;
+    }
     let items;
     try { items = (await note.getLineItems()) || []; } catch (e) { return; }
     // An unloaded note yields no lines. Deriving from that and writing it through is how
@@ -3567,7 +3848,13 @@ class Plugin extends AppPlugin {
               type: "text", geom: geom,
               stroke: u.searchParams.get("stroke") || "red",
               size: parseFloat(u.searchParams.get("size")) || 0.022,
-              content: String(paragraphs.join(" ") || (link.text && link.text.title) || "").trim(),
+              content: (() => {
+                const exact = decodeURIComponent(u.searchParams.get("text") || "");
+                const head = String(paragraphs.join(" ") || (link.text && link.text.title) || "").trim();
+                const flat = exact.replace(/\s*\n\s*/g, " ").trim();
+                if (exact && (!head || head === flat)) return exact;  // untouched: keep the breaks
+                return head || exact;                                  // edited in Thymer: honour it
+              })(),
             };
           } else if (geom) shape = {
             type: shapeType, geom,
@@ -3616,12 +3903,18 @@ class Plugin extends AppPlugin {
     // An empty derivation only clears the store when it came from the note we have already
     // seen holding this PDF's marks. Otherwise we are reading some OTHER note (the panel
     // navigated elsewhere, or it is still loading), and clearing would destroy real work.
-    if (!result.length && kept.length && (!hook._ownerGuid || hook._ownerGuid !== noteGuid)) {
+    const localCount = (this._getLocal()[hook.fingerprint] || []).length;
+    if (!result.length && kept.length > localCount && (!hook._ownerGuid || hook._ownerGuid !== noteGuid)) {
       this._redrawOverlays(hook);
       this._redrawShapes(hook);
       return;
     }
-    store[hook.fingerprint] = result;
+    // The note DOES hold PDF Only marks, in its read-only property: take anything this
+    // device has not seen before carrying them all across.
+    this._readMarksFromNote(hook);
+    // Carry the note-less marks across every rebuild; the derivation above cannot see them.
+    const local = (this._getLocal()[hook.fingerprint] || []).filter((x) => x && x.hid);
+    store[hook.fingerprint] = result.concat(local.filter((x) => !result.some((r) => r.hid === x.hid)));
     this._setStore(store);
     this._redrawOverlays(hook);
     this._redrawShapes(hook);
@@ -3711,6 +4004,189 @@ class Plugin extends AppPlugin {
   // from config (as this used to) returned empty there — _redrawOverlays then saw no
   // highlights and wiped every overlay. The note text remains the durable cross-session
   // source (see _rebuildFromNote), which repopulates this cache on load.
+  // PDF Only marks have no note to be rebuilt from, so the plugin keeps its own collection,
+  // "PDF Marks", with ONE page per PDF. That gives them a durable, syncing home without
+  // touching the schema of whichever collection the reader's note happens to live in — a
+  // PDF can sit in any of them, and a per-collection property would spread across them all.
+  // localStorage stays as the second copy: the page can be deleted, storage can be cleared,
+  // but not both by the same accident.
+  MARKS_COLLECTION() { return "PDF Marks"; }
+
+  // Every one of these is single-flight. Several writes land at once (create, restyle,
+  // the catch-up), and without this they all look up, all miss, and all create — which is
+  // how one PDF ended up with three pages.
+  _marksCollection(create) {
+    if (this._marksCollPending) return this._marksCollPending;
+    const pr = this._marksCollectionInner(create);
+    this._marksCollPending = pr;
+    Promise.resolve(pr).catch(() => {}).then(() => { this._marksCollPending = null; });
+    return pr;
+  }
+
+  async _marksCollectionInner(create) {
+    try {
+      const all = (await this.data.getAllCollections()) || [];
+      const want = this.MARKS_COLLECTION();
+      const found = all.find((c) => { try { return c.getName() === want; } catch (e) { return false; } });
+      if (found) { this._hideMarksCollection(found); return found; }
+      if (!create) return null;
+      const coll = await this.data.createCollection();
+      if (!coll) return null;
+      const cfg = coll.getConfiguration() || {};
+      cfg.name = want;
+      cfg.icon = "ti-skull"; // machine data: the icon is the warning
+      cfg.description = "Marks drawn straight on a PDF, with nothing written to a note. Managed by PDF Highlighter.";
+      // Machine data: out of the sidebar entirely, and out of search. Nobody should meet
+      // these pages by accident while looking for something of their own.
+      cfg.sidebar_display_mode = { mode: "hidden_completely" };
+      cfg.show_cmdpal_items = false;
+      cfg.show_sidebar_items = false;
+      await coll.saveConfiguration(cfg);
+      return coll;
+    } catch (e) { return null; }
+  }
+
+  // Older installs made the collection before it was hidden; put that right once.
+  _hideMarksCollection(coll) {
+    try {
+      if (this._marksHidden) return;
+      const cfg = coll.getConfiguration() || {};
+      const mode = (cfg.sidebar_display_mode || {}).mode;
+      if (mode === "hidden_completely" && cfg.show_cmdpal_items === false) { this._marksHidden = true; return; }
+      cfg.sidebar_display_mode = { mode: "hidden_completely" };
+      cfg.show_cmdpal_items = false;
+      cfg.show_sidebar_items = false;
+      this._marksHidden = true;
+      Promise.resolve(coll.saveConfiguration(cfg)).catch(() => {});
+    } catch (e) {}
+  }
+
+  // One page per PDF. The identity is the page's NAME, not a line: a record's name is set
+  // when it is created and is always there, whereas the first line has to be written
+  // afterwards — and when that write did not land, every later lookup missed and made
+  // another page. The name reads "<pdf> · <fingerprint>", so it stays recognisable.
+  _marksTag(hook) { return String(hook.fingerprint || "").slice(0, 12); }
+
+  _marksPageName(hook) {
+    const base = this._pdfDisplayName(hook).replace(/\.pdf$/i, "") || "PDF";
+    return base + " · " + this._marksTag(hook);
+  }
+
+  _marksRecord(hook, create) {
+    const key = hook.fingerprint;
+    this._marksRec = this._marksRec || {};
+    this._marksRecPending = this._marksRecPending || {};
+    const cached = this._marksRec[key];
+    if (cached) {
+      try { const r = this.data.getRecord(cached); if (r) return Promise.resolve(r); } catch (e) {}
+      delete this._marksRec[key];
+    }
+    if (this._marksRecPending[key]) return this._marksRecPending[key];
+    const pr = this._marksRecordInner(hook, create).then((rec) => {
+      try { if (rec) this._marksRec[key] = rec.getGuid(); } catch (e) {}
+      return rec;
+    });
+    this._marksRecPending[key] = pr;
+    Promise.resolve(pr).catch(() => {}).then(() => { delete this._marksRecPending[key]; });
+    return pr;
+  }
+
+  async _marksRecordInner(hook, create) {
+    try {
+      const coll = await this._marksCollection(create);
+      if (!coll) return null;
+      const tag = " · " + this._marksTag(hook);
+      const recs = (await coll.getAllRecords()) || [];
+      const match = recs.filter((r) => { try { return String(r.getName() || "").endsWith(tag); } catch (e) { return false; } });
+      if (match.length) {
+        // Tidy up anything an earlier race left behind: keep one, bin the empties.
+        for (let i = 1; i < match.length; i++) {
+          try { const items = (await match[i].getLineItems()) || []; if (!items.length) match[i].trash(); } catch (e) {}
+        }
+        return match[0];
+      }
+      if (!create) return null;
+      const guid = coll.createRecord(this._marksPageName(hook));
+      if (!guid) return null;
+      // A freshly created record is not writable the same tick.
+      for (let i = 0; i < 6; i++) {
+        const rec = this.data.getRecord(guid);
+        if (rec) return rec;
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      return null;
+    } catch (e) { return null; }
+  }
+
+  // Writes are debounced: a slider drag calls _restyleShape many times a second, and each
+  // one would otherwise rewrite the page.
+  _writeMarksToNote(hook) {
+    this._marksWriteT = this._marksWriteT || {};
+    clearTimeout(this._marksWriteT[hook.fingerprint]);
+    this._marksWriteT[hook.fingerprint] = setTimeout(() => this._writeMarksNow(hook), 700);
+  }
+
+  async _writeMarksNow(hook) {
+    try {
+      const mine = this._getLocal()[hook.fingerprint] || [];
+      const rec = await this._marksRecord(hook, mine.length > 0);
+      if (!rec) return;
+      const items = (await rec.getLineItems()) || [];
+      const next = mine.length ? JSON.stringify(mine) : "";
+      const dataLine = items[0] || null;
+      const current = dataLine ? (dataLine.segments || [])
+        .filter((sg) => sg.type === "text").map((sg) => sg.text).join("") : "";
+      if (current === next) return; // nothing changed: don't churn the record
+      if (dataLine) dataLine.setSegments([{ type: "text", text: next }]);
+      else if (next) {
+        const l = await rec.createLineItem(null, null, "text");
+        if (l) l.setSegments([{ type: "text", text: next }]);
+      }
+    } catch (e) {}
+  }
+
+  // Anything the page holds that this device has not seen comes back.
+  async _readMarksFromNote(hook) {
+    try {
+      const rec = await this._marksRecord(hook, false);
+      if (!rec) return false;
+      const items = (await rec.getLineItems()) || [];
+      const raw = items[0] ? (items[0].segments || [])
+        .filter((sg) => sg.type === "text").map((sg) => sg.text).join("") : "";
+      if (!raw) return false;
+      const mine = JSON.parse(raw);
+      if (!Array.isArray(mine) || !mine.length) return false;
+      const local = this._getLocal();
+      const have = local[hook.fingerprint] || (local[hook.fingerprint] = []);
+      let added = 0;
+      for (const m of mine) {
+        if (!m || !m.hid || have.some((x) => x.hid === m.hid)) continue;
+        have.push(m); added++;
+      }
+      if (added) { this._setLocal(local); this._redrawOverlays(hook); this._redrawShapes(hook); }
+      return added > 0;
+    } catch (e) { return false; }
+  }
+
+  // Marks made in PDF Only mode have NO note to be rebuilt from, so they need a store of
+  // their own. localStorage is the reliable leg (it works in the browser, where the plugin
+  // config does not read back); the config write is what carries them between desktops.
+  _getLocal() {
+    if (this._localCache) return this._localCache;
+    let m = null;
+    try { m = JSON.parse(window.localStorage.getItem("pdfhl_local") || "null"); } catch (e) {}
+    if (!m) {
+      try { const c = this.getConfiguration(); m = (c && c.custom && c.custom.pdfhl_local) || {}; } catch (e) { m = {}; }
+    }
+    this._localCache = m || {};
+    return this._localCache;
+  }
+
+  _setLocal(map) {
+    this._localCache = map || {};
+    try { window.localStorage.setItem("pdfhl_local", JSON.stringify(this._localCache)); } catch (e) {}
+  }
+
   _getStore() {
     if (this._storeCache) return this._storeCache;
     try {
@@ -3725,6 +4201,7 @@ class Plugin extends AppPlugin {
       const conf = this.getConfiguration();
       conf.custom = conf.custom || {};
       conf.custom.pdfhl_highlights = store;
+      conf.custom.pdfhl_local = this._getLocal();
       // Re-assert settings from in-memory state so a stale getConfiguration() can't drop
       // them when this store write saves (was clobbering the heading toggle).
       conf.custom.useHeading = this._useHeading;

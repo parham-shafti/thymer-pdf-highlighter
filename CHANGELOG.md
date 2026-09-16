@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.6.0 — 2026-09-16
+
+- **PDF Only.** A third choice beside Citation and Comment: mark the page and write nothing to your note. Highlights, shapes and text boxes all honour it. They live in a collection the plugin owns, **PDF Marks**, hidden from the sidebar and from search, so they follow you between devices without putting anything in your notes. It's created the first time you use the mode, and never otherwise.
+- **Rewrite text you've placed.** Double-click a text box to edit it. **Shift+Enter** starts a new line, and line breaks now survive everywhere: on the page, in the note, and in the exported PDF.
+- **Number shortcuts.** **1** to **5** pick a tool, top to bottom. **6**, **7** and **8** choose what the note gets. They only fire inside the PDF, so numbers still type normally in your notes, and never while you're typing in a text box or the find bar.
+- **Fixed: markup disappeared when you zoomed.** Zooming re-renders every page, which takes the overlays with it, and the redraw that should have put them back was being dropped. It's queued now, so the same can't happen on fast scrolling or page changes either.
+- **Fixed: Backspace deleted a shape while you were typing.** The key handler was acting on Delete, Escape and ⌘Z even when a text box or the find bar had the keyboard.
+- **Fixed: the keyboard jumped to your note after every mark**, which turned the tool shortcuts into stray digits typed into it.
+- **On a phone**, marks that don't depend on a note now draw. Thymer shows one panel at a time there, and the whole redraw used to stop when no note was beside the PDF.
+
 ## v2.5.2 — 2026-09-16
 
 - **Fixed: markup could disappear.** Highlights, shapes and text boxes could vanish after refreshing the page, or after navigating away and coming back. The note still held every reference, but nothing was drawn on the PDF and nothing brought it back. The plugin rebuilds its markup from the note, and it could not tell "this note has no marks" apart from "this note hasn't loaded yet" — so an empty read overwrote real work. A note with no lines is now treated as not ready, only the note a PDF is actually filed under may clear it, and the rebuild keeps asking until the note answers instead of giving up after two seconds.
