@@ -8,7 +8,7 @@
 - **Fixed: markup disappeared when you zoomed.** Zooming re-renders every page, which takes the overlays with it, and the redraw that should have put them back was being dropped. It's queued now, so the same can't happen on fast scrolling or page changes either.
 - **Fixed: Backspace deleted a shape while you were typing.** The key handler was acting on Delete, Escape and ⌘Z even when a text box or the find bar had the keyboard.
 - **Fixed: the keyboard jumped to your note after every mark**, which turned the tool shortcuts into stray digits typed into it.
-- **On a phone**, marks that don't depend on a note now draw. Thymer shows one panel at a time there, and the whole redraw used to stop when no note was beside the PDF.
+- **Your markup now shows on a phone or iPad.** Those show one panel at a time, so the note isn't beside the PDF and the marks that are rebuilt from it had nothing to rebuild from. The plugin now keeps a travelling copy on the same synced page, and reads it only where the note can't be reached. The note stays the source of truth everywhere it's open. Deleting a note-backed mark still needs the note, and says so instead of half-removing it.
 
 ## v2.5.2 — 2026-09-16
 

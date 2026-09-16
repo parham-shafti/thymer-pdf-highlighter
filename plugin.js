@@ -3633,6 +3633,17 @@ class Plugin extends AppPlugin {
   }
 
   async _deleteHighlight(hook, hid, silent) {
+    // A note-backed mark is deleted from the NOTE; without it we would clear the overlay and
+    // the note would put it straight back on the next rebuild. Say so rather than pretend.
+    const isLocal = ((this._getLocal()[hook.fingerprint] || []).some((x) => x.hid === hid));
+    if (!isLocal && !this._findAssociatedNote(hook.iframe)) {
+      this.ui.addToaster({
+        title: "Open the note to delete this",
+        message: "This mark is kept in the note, so it can only be removed with the note beside the PDF.",
+        dismissible: true, autoDestroyTime: 4000,
+      });
+      return;
+    }
     if (!silent) { // capture what it takes to recreate this exact mark
       try {
         const e0 = (this._getStore()[hook.fingerprint] || []).find((h) => h.hid === hid);
@@ -3783,10 +3794,11 @@ class Plugin extends AppPlugin {
       // redraw on the note meant a phone drew nothing at all.
       await this._readMarksFromNote(hook);
       const own = this._getLocal()[hook.fingerprint] || [];
-      if (own.length) {
+      const cached = (this._noteCache || {})[hook.fingerprint] || [];
+      if (own.length || cached.length) {
         const st = this._getStore();
         const merged = (st[hook.fingerprint] || []).slice();
-        for (const m of own) if (!merged.some((x) => x.hid === m.hid)) merged.push(m);
+        for (const m of cached.concat(own)) if (!merged.some((x) => x.hid === m.hid)) merged.push(m);
         st[hook.fingerprint] = merged;
         this._setStore(st);
       }
@@ -3916,6 +3928,13 @@ class Plugin extends AppPlugin {
     const local = (this._getLocal()[hook.fingerprint] || []).filter((x) => x && x.hid);
     store[hook.fingerprint] = result.concat(local.filter((x) => !result.some((r) => r.hid === x.hid)));
     this._setStore(store);
+    // Keep the travelling copy in step with the note. Only rewrites when it actually changed.
+    this._noteCache = this._noteCache || {};
+    const before = JSON.stringify(this._noteCache[hook.fingerprint] || []);
+    if (JSON.stringify(result) !== before) {
+      this._noteCache[hook.fingerprint] = result;
+      this._writeMarksToNote(hook);
+    }
     this._redrawOverlays(hook);
     this._redrawShapes(hook);
   }
@@ -4128,11 +4147,17 @@ class Plugin extends AppPlugin {
 
   async _writeMarksNow(hook) {
     try {
+      // The page holds two lists. "own" is the PDF Only marks, which exist nowhere else.
+      // "cache" is a copy of what the note derives, kept only so a device that cannot open
+      // the note beside the PDF (a phone, an iPad) can still draw them. The note always
+      // wins where it is available; the cache is never a source of truth.
       const mine = this._getLocal()[hook.fingerprint] || [];
-      const rec = await this._marksRecord(hook, mine.length > 0);
+      this._noteCache = this._noteCache || {};
+      const cache = this._noteCache[hook.fingerprint] || [];
+      const rec = await this._marksRecord(hook, (mine.length + cache.length) > 0);
       if (!rec) return;
       const items = (await rec.getLineItems()) || [];
-      const next = mine.length ? JSON.stringify(mine) : "";
+      const next = (mine.length || cache.length) ? JSON.stringify({ own: mine, cache: cache }) : "";
       const dataLine = items[0] || null;
       const current = dataLine ? (dataLine.segments || [])
         .filter((sg) => sg.type === "text").map((sg) => sg.text).join("") : "";
@@ -4154,8 +4179,11 @@ class Plugin extends AppPlugin {
       const raw = items[0] ? (items[0].segments || [])
         .filter((sg) => sg.type === "text").map((sg) => sg.text).join("") : "";
       if (!raw) return false;
-      const mine = JSON.parse(raw);
-      if (!Array.isArray(mine) || !mine.length) return false;
+      const parsed = JSON.parse(raw);
+      const mine = Array.isArray(parsed) ? parsed : (parsed.own || []);   // older pages held a bare array
+      this._noteCache = this._noteCache || {};
+      if (!Array.isArray(parsed)) this._noteCache[hook.fingerprint] = parsed.cache || [];
+      if (!mine.length) return false;
       const local = this._getLocal();
       const have = local[hook.fingerprint] || (local[hook.fingerprint] = []);
       let added = 0;

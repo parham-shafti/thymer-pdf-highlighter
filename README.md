@@ -71,6 +71,7 @@ Good to know:
 - **Lossless text on real PDFs.** When a page has a text layer, the plugin reads the actual characters, so the extracted text is exact (no OCR errors). Scanned pages fall back to OCR automatically.
 - **Group under a heading, or not.** Extracts sit under a **Highlights** heading by default. Run **PDF Highlighter: Toggle Highlights heading** from the Command Palette (`Cmd+P` / `Ctrl+P`) to instead drop new extracts at the end of the note.
 - **Your settings are remembered** across reloads — colours, line type, thickness, opacity, text size, OCR language, the text mode and the heading setting.
+- **Phone and iPad.** Those show one panel at a time, so the note isn't beside the PDF. Your markup still draws: the plugin keeps a copy on its own synced page and reads it where the note can't be reached. Deleting a mark that lives in a note still needs the note open beside the PDF.
 - **Keyboard.** **1** to **5** pick a tool, top to bottom; **6**, **7** and **8** choose what the note gets. They work inside the PDF only, so numbers still type normally in your notes.
 - **Undo covers the markup.** Creating, deleting, moving, resizing, restyling and merging quotes are all reversible with **⌘Z** while you're in the PDF.
 - **It follows your theme.** The rail, menus and panels use Thymer's own colours, and a selected shape is outlined in your theme's accent, so it fits whichever of Thymer's themes you use.
