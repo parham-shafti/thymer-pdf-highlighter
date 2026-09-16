@@ -1,5 +1,9 @@
 # Changelog
 
+## v2.7.0 — 2026-09-17
+
+- **Dark page.** Press **9**, or hit the moon in the tool rail, and the PDF inverts for night reading. Only the rendered page is inverted, never your markup: highlights, shapes and text boxes keep their real colours, and so do the document's own, since the filter flips lightness and puts the hues back. Highlights switch to a blend that lightens, so they still read as a band over a dark page instead of burying it. The setting is remembered, and the same key turns it off.
+
 ## v2.6.0 — 2026-09-16
 
 - **PDF Only.** A third choice beside Citation and Comment: mark the page and write nothing to your note. Highlights, shapes and text boxes all honour it. They live in a collection the plugin owns, **PDF Marks**, hidden from the sidebar and from search, so they follow you between devices without putting anything in your notes. It's created the first time you use the mode, and never otherwise.

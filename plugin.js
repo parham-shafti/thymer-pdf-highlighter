@@ -101,6 +101,7 @@ class Plugin extends AppPlugin {
     this._shapeFill = false;    // filled vs outline only
     this._shapeOpacity = 1;     // 0..1
     this._shapeDash = "solid";  // solid | dashed | dotted | dashdot
+    this._darkPdf = false;      // invert the PAGE only, never the markup drawn over it
     this._textSize = 0.022;     // text-box size as a share of page width
     this._useHeading = true;  // group extracts under a "Highlights" heading (toggleable)
     this._lastNoteLineGuid = null; // last note line clicked — insertion point when the heading is off
@@ -117,6 +118,7 @@ class Plugin extends AppPlugin {
       const sf = window.localStorage.getItem("pdfhl_shapeFill"); if (sf === "1") this._shapeFill = true;
       const so = parseFloat(window.localStorage.getItem("pdfhl_shapeOpacity")); if (so > 0 && so <= 1) this._shapeOpacity = so;
       const sd = window.localStorage.getItem("pdfhl_shapeDash"); if (sd) this._shapeDash = sd;
+      if (window.localStorage.getItem("pdfhl_darkPdf") === "1") this._darkPdf = true;
       const ts = parseFloat(window.localStorage.getItem("pdfhl_textSize")); if (ts > 0) this._textSize = ts;
       const tm = window.localStorage.getItem("pdfhl_textMark"); if (tm) this._textMark = tm;
       const mwv = parseInt(window.localStorage.getItem("pdfhl_markWidth"), 10); if (mwv >= 1 && mwv <= 12) this._markWidth = mwv;
@@ -419,9 +421,10 @@ class Plugin extends AppPlugin {
       // Backspace, which used to delete the selected shape while you were fixing a typo.
       const t = e.target;
       if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ""))) return;
-      // 1-5 pick a tool top to bottom, 6-8 pick what the note gets. Digits, not letters:
+      // 1-5 pick a tool top to bottom, 6-8 what the note gets, 9 dark mode. Digits, not
+      // letters:
       // pdf.js owns p/n/j/k/r/h/s, and stealing those would break its own navigation.
-      if (!e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && /^[1-8]$/.test(e.key)) {
+      if (!e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && /^[1-9]$/.test(e.key)) {
         e.preventDefault(); e.stopPropagation();
         this._railShortcut(hook, e.key);
         return;
@@ -541,6 +544,7 @@ class Plugin extends AppPlugin {
     // NOTE: do NOT prune the store on load — it races the note's line-items loading
     // (and can run when the PDF is open without its note beside it), which would
     // wrongly wipe persisted highlights. Deletion is handled by the in-PDF ✕ instead.
+    try { doc.body.classList.toggle("pdfhl-dark", !!this._darkPdf); } catch (e) {}
     this._redrawOverlays(hook);
     this._rebuildFromNote(hook); // re-derive overlays from the durable note text
     // The note's lines can arrive well after the viewer does, and once the pages have
@@ -1342,6 +1346,9 @@ class Plugin extends AppPlugin {
     const exp = mkBtn("pdfhl-export-btn", () => { this._closeFlyout(); this._closeStylePanel(); this._exportAnnotatedPdf(hook); });
     exp.title = "Export Annotated PDF";
     exp.innerHTML = '<svg viewBox="0 0 20 20" width="18" height="18"><path d="M10 3.4 V12.4 M6.4 9.2 L10 12.8 L13.6 9.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 14.4 V15.4 A1.2 1.2 0 0 0 5.2 16.6 H14.8 A1.2 1.2 0 0 0 16 15.4 V14.4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+    const dark = mkBtn("pdfhl-dark-btn", () => { this._closeFlyout(); this._setDarkPdf(!this._darkPdf); });
+    dark.title = "Dark Page (9)";
+    dark.innerHTML = '<svg viewBox="0 0 20 20" width="18" height="18"><path d="M15.2 12.4 A6.2 6.2 0 0 1 7.6 4.8 A6.4 6.4 0 1 0 15.2 12.4 Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>';
     const help = mkBtn("pdfhl-help-btn", (b2) => this._toggleShortcuts(hook, b2));
     help.title = "Shortcuts";
     help.innerHTML = '<svg viewBox="0 0 20 20" width="18" height="18"><circle cx="10" cy="10" r="7.2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7.9 8.1 A2.2 2.2 0 1 1 10.3 10.6 V11.9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="10.3" cy="14.3" r="0.9" fill="currentColor"/></svg>';
@@ -1803,6 +1810,9 @@ class Plugin extends AppPlugin {
         ["Bottom edge", "Open its menu"],
         ["Right-click", "Open its menu"],
       ]],
+      ["Page", [
+        ["9", "Dark page on or off (inverts the page, not your markup)"],
+      ]],
       ["Export", [
         ["Rail arrow", "Save a copy with your markup drawn in"],
         ["Viewer arrow", "The same thing, either one works"],
@@ -1991,6 +2001,18 @@ class Plugin extends AppPlugin {
     this._setTextMark(hook, key);
   }
 
+  _setDarkPdf(on) {
+    this._darkPdf = !!on;
+    try { window.localStorage.setItem("pdfhl_darkPdf", this._darkPdf ? "1" : "0"); } catch (e) {}
+    for (const h of this._hooks || []) {
+      try {
+        h.doc.body.classList.toggle("pdfhl-dark", this._darkPdf);
+        this._redrawOverlays(h); // the blend mode differs between the two
+      } catch (e) {}
+    }
+    this._syncToolRails();
+  }
+
   // 1 Select, 2 Text, 3 Text Box, 4 Shapes, 5 Style, then 6 Citation, 7 Comment, 8 PDF Only.
   _railShortcut(hook, n) {
     this._closeFlyout();
@@ -2002,6 +2024,8 @@ class Plugin extends AppPlugin {
     else if (n === "5") {
       const b = hook.rail && hook.rail.querySelector(".pdfhl-style-btn");
       if (b) this._toggleStylePanel(hook, b);
+    } else if (n === "9") {
+      this._setDarkPdf(!this._darkPdf);
     } else {
       // Changing what the note gets is invisible until a menu is opened, so say it.
       const key = { "6": "citation", "7": "comment", "8": "none" }[n];
@@ -2039,6 +2063,8 @@ class Plugin extends AppPlugin {
     document.querySelectorAll(".pdfhl-tools").forEach((rail) => {
       const selb = rail.querySelector(".pdfhl-select-btn");
       if (selb) this._styleToolButton(selb, this._tool === "select");
+      const db = rail.querySelector(".pdfhl-dark-btn");
+      if (db) this._styleToolButton(db, !!this._darkPdf);
       const yb = rail.querySelector(".pdfhl-type-btn");
       if (yb) this._styleToolButton(yb, this._tool === "type");
       const tb = rail.querySelector(".pdfhl-text-btn");
@@ -3986,7 +4012,7 @@ class Plugin extends AppPlugin {
       // mix-blend-mode belongs on the LAYER, not the boxes: the layer's z-index makes it a
       // stacking context, which isolates blending, so per-box multiply never reached the
       // page canvas and the colour washed over the text instead of tinting it.
-      layer.style.cssText = "position:absolute;pointer-events:none;mix-blend-mode:multiply;z-index:3;left:" + tl.offsetLeft + "px;top:" + tl.offsetTop + "px;width:" + tl.offsetWidth + "px;height:" + tl.offsetHeight + "px;";
+      layer.style.cssText = "position:absolute;pointer-events:none;mix-blend-mode:" + (this._darkPdf ? "screen" : "multiply") + ";z-index:3;left:" + tl.offsetLeft + "px;top:" + tl.offsetTop + "px;width:" + tl.offsetWidth + "px;height:" + tl.offsetHeight + "px;";
       layer.innerHTML = "";
       for (const h of wanted) {
         const rgb = (this.COLORS.find((c) => c.key === h.color) || this.COLORS[0]).rgb;
@@ -4299,6 +4325,12 @@ class Plugin extends AppPlugin {
       ".pdfhl-menu-item:hover{background:rgba(255,255,255,.12);}",
       ".pdfhl-menu-delete:hover{background:#d83a3a;}",
       ".pdfhl-armed .page{cursor:crosshair;}", // the rail itself lives in Thymer's document
+      // Dark mode inverts the rendered PAGE and nothing else. hue-rotate puts the hues back
+      // where they were, so a yellow in the document stays yellow instead of turning blue.
+      // Scoped to the canvas: the text layer is transparent and our overlays are siblings,
+      // so highlights, shapes and text boxes keep their true colours.
+      ".pdfhl-dark .page canvas{filter:invert(1) hue-rotate(180deg);}",
+      ".pdfhl-dark .page{background:#1b1b1b;}",
       this._deleteBtnCSS(),
     ].join("");
     doc.head.appendChild(s);
