@@ -2,6 +2,7 @@
 
 ## v2.7.0 — 2026-09-17
 
+- **Fixed: undo could say it worked without undoing anything.** Removing a mark deletes its line from the note, and that happens asynchronously, so a redraw running in the next moment still saw the line and put the mark straight back. A deleted mark is now ignored until the note actually stops reporting it, which covers every way of removing one, not just undo. The message also tells you when an undo failed, instead of claiming success either way.
 - **Dark page.** Press **9**, or hit the moon in the tool rail, and the PDF inverts for night reading. Only the rendered page is inverted, never your markup: highlights, shapes and text boxes keep their real colours, and so do the document's own, since the filter flips lightness and puts the hues back. Highlights switch to a blend that lightens, so they still read as a band over a dark page instead of burying it. The setting is remembered, and the same key turns it off.
 
 ## v2.6.0 — 2026-09-16

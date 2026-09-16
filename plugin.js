@@ -2417,14 +2417,16 @@ class Plugin extends AppPlugin {
       this.ui.addToaster({ title: redo ? "Nothing to redo" : "Nothing to undo", dismissible: true, autoDestroyTime: 1400 });
       return;
     }
-    try { await (redo ? step.redo() : step.undo()); } catch (e) {}
+    let failed = null;
+    try { await (redo ? step.redo() : step.undo()); } catch (e) { failed = e; }
     to.push(step);
-    await this._rebuildFromNote(hook);
+    await this._rebuildFromNote(hook, true);
     this._redrawShapes(hook);
-    this.ui.addToaster({
-      title: (redo ? "Redid " : "Undid ") + (step.label || "change"),
-      dismissible: true, autoDestroyTime: 1400,
-    });
+    this.ui.addToaster(failed
+      ? { title: (redo ? "Couldn't redo " : "Couldn't undo ") + (step.label || "that"),
+          message: String((failed && failed.message) || failed), dismissible: true }
+      : { title: (redo ? "Redid " : "Undid ") + (step.label || "change"),
+          dismissible: true, autoDestroyTime: 1400 });
   }
 
   // ---- text boxes ----------------------------------------------------------
@@ -3702,6 +3704,10 @@ class Plugin extends AppPlugin {
       if (!store[hook.fingerprint].length) delete store[hook.fingerprint];
       this._setStore(store);
     }
+    // Deleting the note's lines is asynchronous, so a rebuild in the next moment still sees
+    // them and puts the mark straight back. Remember what went, briefly.
+    hook._gone = hook._gone || {};
+    hook._gone[hid] = Date.now();
     this._redrawOverlays(hook);
     this._redrawShapes(hook);
     let wasShape = false;
@@ -3909,7 +3915,7 @@ class Plugin extends AppPlugin {
 
     // locate rects for each, on whatever page is currently rendered; keep prior rects otherwise
     const prior = this._getStore()[hook.fingerprint] || [];
-    const result = hls.map((h) => {
+    let result = hls.map((h) => {
       let rectsByPage = {};
       // Shapes are drawn from their own geometry, not located in the text layer.
       if (h.shape) return { hid: h.hid, page: h.page, color: h.color, shape: h.shape, rectsByPage };
@@ -3950,6 +3956,14 @@ class Plugin extends AppPlugin {
     // The note DOES hold PDF Only marks, in its read-only property: take anything this
     // device has not seen before carrying them all across.
     this._readMarksFromNote(hook);
+    // Drop anything deleted a moment ago whose line the note has not let go of yet. When it
+    // stops appearing the tombstone has done its job and goes.
+    const gone = hook._gone || {};
+    for (const g in gone) {
+      if (Date.now() - gone[g] > 8000) delete gone[g];             // gave up waiting
+      else if (!result.some((r) => r.hid === g)) delete gone[g];   // the deletion landed
+    }
+    result = result.filter((r) => !gone[r.hid]);
     // Carry the note-less marks across every rebuild; the derivation above cannot see them.
     const local = (this._getLocal()[hook.fingerprint] || []).filter((x) => x && x.hid);
     store[hook.fingerprint] = result.concat(local.filter((x) => !result.some((r) => r.hid === x.hid)));
