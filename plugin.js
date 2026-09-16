@@ -402,6 +402,18 @@ class Plugin extends AppPlugin {
     };
     document.addEventListener("click", onPanelDownload, true);
     const onKeyDown = (e) => {
+      // 1-5 pick a tool, top to bottom. Bare digits only, and never while typing — the
+      // text-box editor and pdf.js's find bar both need their numbers. This listener is on
+      // the capture phase, so it would otherwise steal the keystroke before they see it.
+      if (!e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && /^[1-5]$/.test(e.key)) {
+        const t = e.target;
+        const typing = !!(t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || "")));
+        if (!typing) {
+          e.preventDefault(); e.stopPropagation();
+          this._railShortcut(hook, e.key);
+          return;
+        }
+      }
       // Bound to the VIEWER only: in the note, ⌘Z stays Thymer's own undo.
       if ((e.metaKey || e.ctrlKey) && String(e.key).toLowerCase() === "z") {
         e.preventDefault(); e.stopPropagation();
@@ -506,8 +518,18 @@ class Plugin extends AppPlugin {
     // wrongly wipe persisted highlights. Deletion is handled by the in-PDF ✕ instead.
     this._redrawOverlays(hook);
     this._rebuildFromNote(hook); // re-derive overlays from the durable note text
-    setTimeout(() => this._rebuildFromNote(hook), 700);
-    setTimeout(() => this._rebuildFromNote(hook), 2000);
+    // The note's lines can arrive well after the viewer does, and once the pages have
+    // rendered nothing else triggers a rebuild. Keep asking until it answers, then stop.
+    let tries = 0;
+    const retry = () => {
+      if (!iframe.isConnected) return;
+      Promise.resolve(this._rebuildFromNote(hook)).catch(() => {}).then(() => {
+        const found = (this._getStore()[hook.fingerprint] || []).length;
+        if (found || ++tries > 12) return;
+        setTimeout(retry, 600 + tries * 400);
+      });
+    };
+    setTimeout(retry, 600);
   }
 
   // =======================================================================
@@ -1184,7 +1206,7 @@ class Plugin extends AppPlugin {
 
     // Select: plain text selection (copy without marking) and picking shapes. No fly-out.
     const selBtn = mkBtn("pdfhl-select-btn", () => { this._closeFlyout(); this._setTool(hook, "select"); });
-    selBtn.title = "Select";
+    selBtn.title = "Select (1)";
     selBtn.innerHTML = '<svg viewBox="0 0 20 20" width="18" height="18"><path d="M5.5 3.2 L14.6 9.8 L10.4 10.5 L12.7 15 L10.9 15.9 L8.7 11.4 L5.5 14.1 Z" fill="currentColor"/></svg>';
     const textBtn = mkBtn("pdfhl-text-btn", null);
     wireSplit(textBtn,
@@ -1195,7 +1217,7 @@ class Plugin extends AppPlugin {
       ], (k) => this._setTextChoice(hook, k)));
     // Text boxes: typed straight onto the PDF, deliberately NOT written to the note.
     const typeBtn = mkBtn("pdfhl-type-btn", () => { this._closeFlyout(); this._setTool(hook, "type"); });
-    typeBtn.title = "Text Box";
+    typeBtn.title = "Text Box (3)";
     typeBtn.innerHTML = '<svg viewBox="0 0 20 20" width="18" height="18"><path d="M4.4 6.2 V4.6 H15.6 V6.2 M10 4.6 V15.4 M7.8 15.4 H12.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
     const shapeBtn = mkBtn("pdfhl-shape-btn", null);
     wireSplit(shapeBtn,
@@ -1209,7 +1231,7 @@ class Plugin extends AppPlugin {
     rail.appendChild(sep);
     const style = doc.createElement("button");
     style.className = "pdfhl-tool pdfhl-style-btn";
-    style.title = "Style";
+    style.title = "Style (5)";
     this._styleToolButton(style, false);
     style.innerHTML = '<span class="pdfhl-style-dot" style="width:15px;height:15px;border-radius:4px;display:block;box-shadow:inset 0 0 0 1px rgba(128,128,128,.6),0 0 0 1.5px var(--side-bg-color,#1c1f22),0 0 0 3px rgba(128,128,128,.45);"></span>';
     style.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); });
@@ -1662,6 +1684,7 @@ class Plugin extends AppPlugin {
         ["Esc", "Undo them"],
       ]],
       ["Tool rail", [
+        ["1 - 5", "Pick a tool, top to bottom"],
         ["Export", "Save a copy of the PDF with your markup"],
         ["Click", "Use the tool shown"],
         ["Bottom edge", "Open its menu"],
@@ -1847,6 +1870,20 @@ class Plugin extends AppPlugin {
     this._setTextMark(hook, key);
   }
 
+  // The rail, by number: 1 Select, 2 Text, 3 Text Box, 4 Shapes, 5 Style.
+  _railShortcut(hook, n) {
+    this._closeFlyout();
+    this._closeShortcuts();
+    if (n === "1") this._setTool(hook, "select");
+    else if (n === "2") this._setTool(hook, "text");
+    else if (n === "3") this._setTool(hook, "type");
+    else if (n === "4") this._setShapeTool(hook, this._shapeTool);
+    else if (n === "5") {
+      const b = hook.rail && hook.rail.querySelector(".pdfhl-style-btn");
+      if (b) this._toggleStylePanel(hook, b);
+    }
+  }
+
   // Marking text: which treatment a selection gets. Always returns to text mode.
   _setTextMark(hook, key) {
     this._textMark = key;
@@ -1878,13 +1915,13 @@ class Plugin extends AppPlugin {
       const tb = rail.querySelector(".pdfhl-text-btn");
       if (tb) {
         this._styleToolButton(tb, this._tool === "text");
-        tb.title = mark.label;
+        tb.title = mark.label + " (2)";
         tb.innerHTML = '<svg viewBox="0 0 20 20" width="18" height="18">' + mark.svg + "</svg>" + caret;
       }
       const sb = rail.querySelector(".pdfhl-shape-btn");
       if (sb) {
         this._styleToolButton(sb, this._isShapeTool());
-        sb.title = shape.label;
+        sb.title = shape.label + " (4)";
         sb.innerHTML = '<svg viewBox="0 0 20 20" width="18" height="18">' + shape.svg + "</svg>" + caret;
       }
     });
@@ -3478,6 +3515,10 @@ class Plugin extends AppPlugin {
     if (!note) return; // can't reach the note — keep whatever the store has
     let items;
     try { items = (await note.getLineItems()) || []; } catch (e) { return; }
+    // An unloaded note yields no lines. Deriving from that and writing it through is how
+    // every overlay used to vanish on refresh: empty result -> empty store -> nothing drawn,
+    // with no trigger left to bring them back. Treat it as "not ready", not as "none".
+    if (!items.length) return;
 
     // Group children by parent. A highlight is a RUN of sibling lines ending at the line
     // that carries the backlink: a normal extract is a quote block whose one run is all
@@ -3568,6 +3609,18 @@ class Plugin extends AppPlugin {
     });
 
     const store = this._getStore();
+    const kept = store[hook.fingerprint] || [];
+    let noteGuid = null;
+    try { noteGuid = note.getGuid(); } catch (e) {}
+    if (result.length) hook._ownerGuid = noteGuid; // this note demonstrably holds this PDF's marks
+    // An empty derivation only clears the store when it came from the note we have already
+    // seen holding this PDF's marks. Otherwise we are reading some OTHER note (the panel
+    // navigated elsewhere, or it is still loading), and clearing would destroy real work.
+    if (!result.length && kept.length && (!hook._ownerGuid || hook._ownerGuid !== noteGuid)) {
+      this._redrawOverlays(hook);
+      this._redrawShapes(hook);
+      return;
+    }
     store[hook.fingerprint] = result;
     this._setStore(store);
     this._redrawOverlays(hook);

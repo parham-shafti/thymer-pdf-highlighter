@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.5.2 — 2026-09-16
+
+- **Fixed: markup could disappear.** Highlights, shapes and text boxes could vanish after refreshing the page, or after navigating away and coming back. The note still held every reference, but nothing was drawn on the PDF and nothing brought it back. The plugin rebuilds its markup from the note, and it could not tell "this note has no marks" apart from "this note hasn't loaded yet" — so an empty read overwrote real work. A note with no lines is now treated as not ready, only the note a PDF is actually filed under may clear it, and the rebuild keeps asking until the note answers instead of giving up after two seconds.
+- **Number shortcuts for the tool rail.** 1 Select, 2 Text, 3 Text Box, 4 Shapes, 5 Style, top to bottom. They work only inside the PDF, so numbers still type normally in your note, and never fire while you're typing in a text box or the find bar.
+
 ## v2.5.1 — 2026-09-02
 
 - **Both download arrows now export your markup.** The PDF viewer's own download button used to save the original file, silently and without markup, while the plugin's export lived in the tool rail. Now either one gives you the annotated PDF.
